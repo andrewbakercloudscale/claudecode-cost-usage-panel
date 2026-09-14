@@ -1,18 +1,16 @@
 # Claude Code Cost & Usage Panel
 
-Live, always-visible cost and token tracking for **Claude Code** and **OpenCode**, running in a right-hand [Ghostty](https://ghostty.org/) split next to your terminal session — so you can watch what a coding agent is actually costing you, turn by turn, instead of finding out at the end of the month.
+Live, always-visible cost and token tracking for **[Claude Code](https://claude.com/claude-code)**, running in a right-hand [Ghostty](https://ghostty.org/) split next to your terminal session — so you can watch what a coding agent is actually costing you, turn by turn, instead of finding out at the end of the month.
 
 This came out of a simple problem: AI coding agents burn tokens and money per turn, per session, per day — and none of that is visible while you're working. You only find out later, from a dashboard or an invoice, by which point the expensive session is long over and you've learned nothing you can act on. This repo is the fix: a live panel that sits next to your terminal and updates every few seconds.
+
+The same panel for OpenCode lives in **[opencode-cost-usage-panel](https://github.com/andrewbakercloudscale/opencode-cost-usage-panel)** — the two were one repo until they were split apart, which is why the design notes here and there cross-reference each other.
 
 Full write-up and motivation: **[AI coding costs are guesswork without this: instrumenting OpenCode and Claude Code](https://andrewbaker.ninja/2026/08/22/ai-coding-costs-are-guesswork-without-this-instrumenting-opencode-and-claude-code/)**
 
 ## What you get
 
-Two independent installers, one per agent. Run either or both.
-
-### `claude-panel-setup.sh`
-
-Installs a live panel for [Claude Code](https://claude.com/claude-code), built on top of [`ccusage`](https://github.com/ryoppippi/ccusage):
+`claude-panel-setup.sh` installs a live panel for Claude Code, built on top of [`ccusage`](https://github.com/ryoppippi/ccusage):
 
 - **Per-turn breakdown of the current session** — turn number, model, context size, context growth (Δ) since the last turn, cache hit %, and estimated cost per turn, read straight out of the session transcript and priced against Anthropic's published per-model rates (including cache read/write multipliers).
 - **Live status line** — current session value, today's value, active-block burn rate, 7-day average session cost, 30-day value, and the current project folder. ("Value" because these are priced at pay-as-you-go API rates regardless of what plan you're actually on — see note below.)
@@ -37,32 +35,24 @@ UserPromptSubmit says: 🟣 RUNAWAY COST — $61.00 this session, 7.4x your $8.2
 
 On Ghostty it also fires a real macOS desktop notification (OSC 777) alongside the chat line; every other terminal gets a bell. And it **pushes to Telegram**, which is the only one of the three channels that will reach a phone you aren't currently looking at — credentials come from the shared `~/Desktop/github/.creds` (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID`), the same store the Pi watchdogs use. Set `CLAUDE_COST_ALERT_TELEGRAM=0` to turn the push off; `bash check-panel-status.sh` reports whether it's configured and whether any sends have failed.
 
-### `opencode-panel-setup.sh`
+### Launching
 
-Same idea for [OpenCode](https://opencode.ai/):
-
-- **Per-turn breakdown** — turn, provider/model, context size, Δ cache write, cache hit %, cost — parsed from `opencode export <session>`.
-- **7-day average session cost** baseline, from `opencode session list --format json`.
-- **Today / last 7 days**, shown via OpenCode's own `opencode stats` output (deliberately *not* reparsed as JSON — see the note in the script header about why `opencode stats --json`'s shape isn't stable enough to trust yet).
-
-### Shared behaviour (both installers)
-
-- **Auto-launch on first use per window.** A `preexec` hook in `~/.zshrc` watches for the first `claude...` / `opencode...` command typed in a terminal window and opens the panel automatically — you never have to remember to start it.
+- **Auto-launch on first use per window.** A `preexec` hook in `~/.zshrc` watches for the first `claude...` command typed in a terminal window and opens the panel automatically — you never have to remember to start it.
 - **tmux-aware.** If you're inside a tmux session, the launcher uses tmux's own `split-window` instead of driving Ghostty via AppleScript — no Accessibility permission or keystroke simulation needed. This matters because tmux overrides `$TERM_PROGRAM` to `tmux` regardless of the outer terminal, so without this check the Ghostty path below would silently fail to detect Ghostty even when Ghostty is the real host.
 - **Auto-resize** to roughly 1/3 of the window width — via tmux's `split-window -l 33%` inside tmux, or Ghostty keybinds (`ctrl+shift+h` / `ctrl+shift+l`, added to `~/.config/ghostty/config` if missing) otherwise — then focus returns to your original pane.
 - **Verified, not assumed (Ghostty path).** The launcher drives Ghostty via `osascript`/System Events, retries up to 3 times, and confirms success by checking that a new panel *process* actually exists — not just that AppleScript returned exit code 0, which it will happily do even when nothing happened.
-- **Logged.** Every launch attempt is logged with a shared run ID (`~/.cache/claude-panel-launch.log` / `~/.cache/opencode-panel-launch.log`) so a failed auto-launch is diagnosable instead of just silently missing.
-- **Idempotent.** Safe to re-run any time — it overwrites the two generated scripts with the latest version and skips any `.zshrc`/config block that's already present.
-- **Finder Service aware.** If you launch Claude Code via a Finder Service / Automator workflow (`ghostty-claude-launcher`) rather than an interactive shell, the Claude installer patches that script too, since the `preexec` hook never fires for it.
+- **Logged.** Every launch attempt is logged with a shared run ID (`~/.cache/claude-panel-launch.log`) so a failed auto-launch is diagnosable instead of just silently missing.
+- **Idempotent.** Safe to re-run any time — it overwrites the generated scripts with the latest version and skips any `.zshrc`/config block that's already present.
+- **Finder Service aware.** If you launch Claude Code via a Finder Service / Automator workflow (`ghostty-claude-launcher`) rather than an interactive shell, the installer patches that script too, since the `preexec` hook never fires for it.
 
 ## How it works
 
-Both installers follow the same shape: a **panel script** (the thing that renders live stats in a loop) and a **launcher script** (the thing that opens a Ghostty split and starts the panel in it), plus a small `~/.zshrc` hook that fires the launcher automatically. A few decisions in there aren't obvious from the code alone:
+The installer lays down a **panel script** (the thing that renders live stats in a loop) and a **launcher script** (the thing that opens a Ghostty split and starts the panel in it), plus a small `~/.zshrc` hook that fires the launcher automatically. A few decisions in there aren't obvious from the code alone:
 
-- **Per-turn cost isn't available from either agent's own tooling, so both panels compute it themselves.** `ccusage` and `opencode stats` only expose session/day/block-level totals, not a per-message figure. Both panels instead read the raw session transcript directly (Claude Code's `~/.claude/projects/*/*.jsonl`, or `opencode export <session>`) and price every assistant turn from its token usage: input, output, cache read, and cache write tokens, each at Anthropic's published per-model rate (cache read at 0.1x the input rate, cache write at 1.25x/2x for 5-minute/1-hour cache). That's what makes the "per turn" table possible — it doesn't exist anywhere else.
-- **The context-window math is fragile in a specific way, and the code works around it.** The Claude panel needs the *real* session ID and model ID from the transcript — a placeholder ID silently returns a `$0.00` session cost instead of erroring, and an unset model ID makes `ccusage` assume an old 200k context window instead of Sonnet 5's actual 1M, which makes context usage read as `>100%`. Both failure modes are silent, which is exactly the kind of thing this project exists to prevent, so the panel derives both IDs from the transcript itself rather than trusting a default.
-- **Rendering never trusts the pane's current size to stay put.** The panel is meant to sit in a resizable split, so every frame is measured against the *current* terminal width/height (`tput cols`/`tput lines`) rather than a fixed layout, and every printed line is padded with `\033[K` (clear-to-end-of-line) so a shorter new frame can't leave stale characters from a wider previous one ghosting through. The Claude panel goes further: the per-turn table is rendered as a "guaranteed" block that's never truncated, and only the sections below it (active block, today, trends, top sessions) compete for whatever pane height is left — so asking for the last 20 turns always means 20 turns, never "20 turns if there's room."
-- **The AppleScript automation verifies itself instead of trusting its own exit code.** Both launcher scripts drive Ghostty via `osascript`/System Events to open a split, type the panel command, and resize the pane. AppleScript will report success (exit 0, no stderr) even when a stale frontmost check or an internal early `return` meant nothing actually happened — so the launcher doesn't believe it. It snapshots running panel processes before the attempt, snapshots them again after, and only calls it a success if a *new* process actually appeared. It retries up to 3 times and logs every attempt (with a shared run ID, so concurrent window opens don't interleave into an unreadable log) to `~/.cache/{claude,opencode}-panel-launch.log`.
+- **Per-turn cost isn't available from Claude Code's own tooling, so the panel computes it itself.** `ccusage` only exposes session/day/block-level totals, not a per-message figure. The panel instead reads the raw session transcript directly (`~/.claude/projects/*/*.jsonl`) and prices every assistant turn from its token usage: input, output, cache read, and cache write tokens, each at Anthropic's published per-model rate (cache read at 0.1x the input rate, cache write at 1.25x/2x for 5-minute/1-hour cache). That's what makes the "per turn" table possible — it doesn't exist anywhere else.
+- **The context-window math is fragile in a specific way, and the code works around it.** The panel needs the *real* session ID and model ID from the transcript — a placeholder ID silently returns a `$0.00` session cost instead of erroring, and an unset model ID makes `ccusage` assume an old 200k context window instead of Sonnet 5's actual 1M, which makes context usage read as `>100%`. Both failure modes are silent, which is exactly the kind of thing this project exists to prevent, so the panel derives both IDs from the transcript itself rather than trusting a default.
+- **Rendering never trusts the pane's current size to stay put.** The panel is meant to sit in a resizable split, so every frame is measured against the *current* terminal width/height (`tput cols`/`tput lines`) rather than a fixed layout, and every printed line is padded with `\033[K` (clear-to-end-of-line) so a shorter new frame can't leave stale characters from a wider previous one ghosting through. It goes further still: the per-turn table is rendered as a "guaranteed" block that's never truncated, and only the sections below it (active block, today, trends, top sessions) compete for whatever pane height is left — so asking for the last 20 turns always means 20 turns, never "20 turns if there's room."
+- **The AppleScript automation verifies itself instead of trusting its own exit code.** The launcher drives Ghostty via `osascript`/System Events to open a split, type the panel command, and resize the pane. AppleScript will report success (exit 0, no stderr) even when a stale frontmost check or an internal early `return` meant nothing actually happened — so the launcher doesn't believe it. It snapshots running panel processes before the attempt, snapshots them again after, and only calls it a success if a *new* process actually appeared. It retries up to 3 times and logs every attempt (with a shared run ID, so concurrent window opens don't interleave into an unreadable log) to `~/.cache/claude-panel-launch.log`.
 - **The panel is told which session it is watching; it does not work it out.** A project directory holds every transcript that directory has ever produced, so "which of these is the conversation in the pane next to me" has no answer the panel can compute — two `claude` sessions open in one directory are indistinguishable by file. The answer is written down instead: `claude-panel-session-hook.sh` fires on Claude Code's `SessionStart` event and writes `<session-id>` where the panel can read it on every tick. Because the hook runs *inside* the session, it is authoritative rather than predictive — it covers `--resume`, `--continue`, GUI windows and IDE terminals, none of which the `~/.zshrc` `preexec` hook can pin in advance. The launcher writes the same thing for the id it chose, so the pin still works with hooks disabled.
 - **The pin is addressed to a pane, not to a directory.** `~/.cache/claude-panel-pin/tty/<claude-tty>` holds the session id; `~/.cache/claude-panel-pin/pane/<panel-tty>` holds `<claude-tty>  <panel-pid>`, written by the launcher — the one process that ever sees both halves, because it runs in the claude pane's own shell and then watches the new panel appear. `~/.cache/claude-panel-pin/<project-dir>` still exists and is still read, but only by a panel with no pairing (started by hand, or through a path with no launcher).
 
@@ -93,44 +83,36 @@ Both installers follow the same shape: a **panel script** (the thing that render
 
 ## Requirements
 
-- macOS + [Ghostty](https://ghostty.org/) for the auto-split part — unless you run inside tmux, in which case tmux's own split is used instead and Ghostty isn't required. The panel scripts themselves work in any terminal if you just run them manually.
+- macOS + [Ghostty](https://ghostty.org/) for the auto-split part — unless you run inside tmux, in which case tmux's own split is used instead and Ghostty isn't required. The panel script itself works in any terminal if you just run it manually.
 - `jq`
+- Node.js (for [`ccusage`](https://github.com/ryoppippi/ccusage)) and Python 3
 - Accessibility permission granted to Ghostty (macOS will prompt the first time the launcher tries to drive it via System Events) — not needed for the tmux path
-- For the Claude Code panel: Node.js (for [`ccusage`](https://github.com/ryoppippi/ccusage)) and Python 3
-- For the OpenCode panel: the `opencode` CLI on your `PATH`
 
 ## Install
 
 ```bash
-# Claude Code panel
 bash claude-panel-setup.sh
-
-# OpenCode panel
-bash opencode-panel-setup.sh
 ```
 
-Or deploy both (or one) at once with the wrapper script:
+Or via the wrapper script:
 
 ```bash
-bash deploy.sh            # both panels
-bash deploy.sh claude     # Claude Code panel only
-bash deploy.sh opencode   # OpenCode panel only
+bash deploy.sh
 ```
 
-`deploy.sh` doesn't do anything the installers above don't already do on their own — there's no remote server for this repo, so "deploy" means re-running the installer(s) to pick up the latest script changes on this machine. It's just a single command to re-run after pulling changes, mirroring the `deploy-*.sh` convention used elsewhere. Safe to re-run any time; both installers are idempotent.
+`deploy.sh` doesn't do anything the installer above doesn't already do on its own — there's no remote server for this repo, so "deploy" means re-running the installer to pick up the latest script changes on this machine. It's just a single command to re-run after pulling changes, mirroring the `deploy-*.sh` convention used elsewhere. Safe to re-run any time; the installer is idempotent. `bash deploy.sh claude` still works too — the argument existed while this repo also held the OpenCode panel, and quietly ignoring a word that used to mean something is the failure this project is about.
 
-Then open a **new** terminal window/tab (or `source ~/.zshrc`) and type a `claude...` or `opencode...` command — the panel opens automatically in a right-hand split.
+Then open a **new** terminal window/tab (or `source ~/.zshrc`) and type a `claude...` command — the panel opens automatically in a right-hand split.
 
-You can also run either panel manually at any time, in any terminal:
+You can also run the panel manually at any time, in any terminal:
 
 ```bash
 ~/.local/bin/ccusage-panel.sh [refresh_seconds] [turn_rows]
-~/.local/bin/opencode-panel.sh [refresh_seconds] [turn_rows]
 ```
 
-### Refresh tiers (Claude panel)
+### Refresh tiers
 
-The Claude panel redraws on two clocks, and **each section header states its
+The panel redraws on two clocks, and **each section header states its
 own rate** so you can always see how old the number under it can be:
 
 | Section | Default rate | Argument |
@@ -163,7 +145,7 @@ moving between fetches without one.
 
 ## FAQ
 
-- **Sonnet 5 (and Fable 5) burns through tokens much faster than Sonnet 4.6 did on the same kind of task — is there a way to cap it back to a 200k context window?** Yes. Set `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` in your shell profile. Claude Code then treats Sonnet 5 / Fable 5 as having a 200k context window instead of their native 1M, removes the 1M variant from the model picker, and — this is the part that actually matters for cost — **auto-compaction kicks in at the 200k boundary**, the same discipline that was implicitly keeping 4.6's token usage in check. You don't need to switch models back to get that behavior. The Claude panel shows which cap is currently in effect (`🧭 Context cap: 200k (forced via CLAUDE_CODE_DISABLE_1M_CONTEXT)` vs `1M (native)`) so it's visible at a glance rather than something you have to remember you set.
+- **Sonnet 5 (and Fable 5) burns through tokens much faster than Sonnet 4.6 did on the same kind of task — is there a way to cap it back to a 200k context window?** Yes. Set `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` in your shell profile. Claude Code then treats Sonnet 5 / Fable 5 as having a 200k context window instead of their native 1M, removes the 1M variant from the model picker, and — this is the part that actually matters for cost — **auto-compaction kicks in at the 200k boundary**, the same discipline that was implicitly keeping 4.6's token usage in check. You don't need to switch models back to get that behavior. The panel shows which cap is currently in effect (`🧭 Context cap: 200k (forced via CLAUDE_CODE_DISABLE_1M_CONTEXT)` vs `1M (native)`) so it's visible at a glance rather than something you have to remember you set.
 - **`/context` shows 200k even though I selected Sonnet 5 — did it silently downgrade to 4.6?** Not necessarily. `/context` reports usage against whichever window is *currently active* for the session, and if `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` is set (or you're behind an LLM gateway that defaults Sonnet 5 to 200k), you'll correctly see a 200k ceiling while genuinely running Sonnet 5. Check the per-turn `Model` column in the panel — it reads the real model ID out of the transcript for every turn — rather than inferring the model from the context-window size alone.
 - **Does the generic `sonnet` alias always mean the latest Sonnet?** It's provider-dependent, not a bug: on the Anthropic API directly, `sonnet` resolves to the latest Sonnet (Sonnet 5 as of this writing). On Claude Platform via AWS it currently resolves to Sonnet 4.6; on Bedrock/Google Cloud/Microsoft Foundry it resolves to Sonnet 4.5. If you want a specific version regardless of provider, select it explicitly rather than relying on the bare alias.
 
@@ -175,19 +157,23 @@ in two cases shipped twice.
 
 | Document | Covers |
 |---|---|
-| [`SLOW-TIER-PLAN.md`](SLOW-TIER-PLAN.md) | The Claude panel's refresh tiers, caching, TTL buckets, error surfacing, and every gate that failed silently on the way. The rollout log at §10 is the index. |
-| [`OPENCODE-TIER-PLAN.md`](OPENCODE-TIER-PLAN.md) | The same pass for the OpenCode panel, which had no caching at all (28.44 → 8.57 CPU-s / 60s). |
+| [`SLOW-TIER-PLAN.md`](SLOW-TIER-PLAN.md) | This panel's refresh tiers, caching, TTL buckets, error surfacing, and every gate that failed silently on the way. The rollout log at §10 is the index. |
 | [`LAUNCHER-TARGETING.md`](LAUNCHER-TARGETING.md) | **Which window gets the panel**, and why that is a hard question. The panel is not bound to the terminal process — the launcher types keystrokes into whatever window has focus. Read this before touching the frontmost check. |
 | [`OPTIMIZATION-PLAN.md`](OPTIMIZATION-PLAN.md) | Superseded by `SLOW-TIER-PLAN.md`; kept as the record of an investigation whose conclusion was right and whose attribution was wrong. |
 
+Both of the remaining documents were written while the OpenCode panel shared
+this repo and refer to it in places. The equivalent pass for that panel is
+[`OPENCODE-TIER-PLAN.md`](https://github.com/andrewbakercloudscale/opencode-cost-usage-panel/blob/main/OPENCODE-TIER-PLAN.md),
+which moved with it.
+
 ## Troubleshooting
 
-- **Panel never opens automatically** — check `~/.cache/claude-panel-launch.log` or `~/.cache/opencode-panel-launch.log`. If you're outside tmux, the most common cause is Ghostty missing Accessibility permission (System Settings → Privacy & Security → Accessibility). If you're inside tmux, confirm `tmux` is actually on `$PATH` for that shell (the log will say `TMUX is set but tmux binary not found` if not).
+- **Panel never opens automatically** — check `~/.cache/claude-panel-launch.log`. If you're outside tmux, the most common cause is Ghostty missing Accessibility permission (System Settings → Privacy & Security → Accessibility). If you're inside tmux, confirm `tmux` is actually on `$PATH` for that shell (the log will say `TMUX is set but tmux binary not found` if not).
 - **A new window opens with no panel, but only sometimes** — mostly fixed. The launcher now addresses its keystrokes to its own Ghostty *process* (`CGEventPostToPid`), so focus is irrelevant and the split cannot land in another window. That needs pyobjc's Quartz bindings, which are not on stock macOS: `pip3 install pyobjc-framework-Quartz` (or use a Homebrew python) enables it, and `~/.cache/claude-panel-launch.log` says which path each run took. Without them the launcher uses the older focus-dependent path, which refuses to type when it cannot positively identify the focused window — safe, but occasionally no panel. Recover by running `~/.local/bin/ccusage-panel.sh` in a split yourself. Background in [`LAUNCHER-TARGETING.md`](LAUNCHER-TARGETING.md). — the launcher can only split the window that has keyboard focus, and it refuses to type when it cannot positively identify that window as the one it was launched from. With several Ghostty instances running that identification can be ambiguous, and it skips rather than risk typing a shell command into whatever you are working in. The log line names every instance it saw and which one held focus. Recover by running `~/.local/bin/ccusage-panel.sh` in a split yourself. Background in [`LAUNCHER-TARGETING.md`](LAUNCHER-TARGETING.md).
 - **Split opens but stays 50/50** — outside tmux, make sure `~/.config/ghostty/config` has the `resize_split` keybinds the installer adds (`ctrl+shift+h` / `ctrl+shift+l`); if that file didn't exist when you installed, create it and re-run the installer. Inside tmux this shouldn't happen — the launcher opens the split at 1/3 width directly via `split-window -l 33%`.
 - **`Model: Unknown` and `no active Claude Code session found`, while every other figure is correct** — the panel has not been told which transcript is this pane's. Check `~/.cache/claude-panel-pin.log`: it records every pin adopted, ignored or abandoned, and every pane pairing learned. If the log shows no `paired:` line for this panel, it is falling back to the directory-keyed pin — which is shared with every other session in the repo, so a second window opened there is enough to point it somewhere else. Confirm `~/.claude/settings.json` has the `SessionStart` hook (`jq '.hooks.SessionStart' ~/.claude/settings.json`) and that `~/.cache/claude-panel-pin/tty/<your-claude-tty>` (`ps -o tty= -p $$` in the claude pane) names your current session id. Re-running `bash deploy.sh claude` installs the hook; it takes effect on the *next* session start, not the current one.
-- **Context % looks wrong / costs look off** — the Claude panel infers the model ID from the live transcript to price each turn and size the context window correctly; if pricing changes on Anthropic's side, update the `PRICES` table inside `ccusage-panel.sh`.
-- **"Value" figures don't match my actual bill** — expected on Pro/Max/Team plans. Every $ figure in both panels is `local token count × pay-as-you-go API rate`, not a real charge — it's a proxy for how much of the model you're using, not an invoice. Flat-rate subscribers will see numbers well above (or below) what they're actually billed.
+- **Context % looks wrong / costs look off** — the panel infers the model ID from the live transcript to price each turn and size the context window correctly; if pricing changes on Anthropic's side, update the `PRICES` table inside `ccusage-panel.sh`.
+- **"Value" figures don't match my actual bill** — expected on Pro/Max/Team plans. Every $ figure in the panel is `local token count × pay-as-you-go API rate`, not a real charge — it's a proxy for how much of the model you're using, not an invoice. Flat-rate subscribers will see numbers well above (or below) what they're actually billed.
 
 ## License
 

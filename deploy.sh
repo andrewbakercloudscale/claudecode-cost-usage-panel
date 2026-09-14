@@ -1,45 +1,45 @@
 #!/usr/bin/env bash
-# Deploy the panel installer(s) to this machine.
+# Deploy the panel installer to this machine.
 #
-# There's no remote server here — both installers already write straight to
+# There's no remote server here — the installer already writes straight to
 # ~/.local/bin, ~/.zshrc, ~/.config/ghostty/config, and ~/.claude/settings.json,
-# so "deploy" means "run the installer(s) again to pick up the latest script
-# changes." Both are idempotent (see README's "Idempotent" note), so re-running
+# so "deploy" means "run the installer again to pick up the latest script
+# changes." It's idempotent (see README's "Idempotent" note), so re-running
 # after every edit is always safe.
 #
+# It took a `claude`/`opencode`/`all` argument until the OpenCode panel moved
+# to its own repo (opencode-cost-usage-panel). `bash deploy.sh claude` is still
+# accepted, because the README, the troubleshooting notes and a year of muscle
+# memory all say it -- silently doing nothing for a word that used to work is
+# the failure this project is about.
+#
 # Usage:
-#   bash deploy.sh            # deploy both panels (default)
-#   bash deploy.sh claude     # deploy only the Claude Code panel
-#   bash deploy.sh opencode   # deploy only the OpenCode panel
+#   bash deploy.sh
+#   bash deploy.sh claude     # accepted; same thing
 
 set -euo pipefail
 
 main() {
-  local target="${1:-all}"
+  local target="${1:-claude}"
   local dir
   dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
   case "$target" in
-    claude)
-      echo "==> Deploying Claude Code panel..."
-      bash "$dir/claude-panel-setup.sh"
-      ;;
+    claude|all) ;;
     opencode)
-      echo "==> Deploying OpenCode panel..."
-      bash "$dir/opencode-panel-setup.sh"
-      ;;
-    all)
-      echo "==> Deploying Claude Code panel..."
-      bash "$dir/claude-panel-setup.sh"
-      echo
-      echo "==> Deploying OpenCode panel..."
-      bash "$dir/opencode-panel-setup.sh"
+      echo "The OpenCode panel now lives in its own repo:" >&2
+      echo "  https://github.com/andrewbakercloudscale/opencode-cost-usage-panel" >&2
+      echo "Run 'bash deploy.sh' there instead." >&2
+      exit 1
       ;;
     *)
-      echo "usage: bash deploy.sh [claude|opencode|all]" >&2
+      echo "usage: bash deploy.sh [claude]" >&2
       exit 1
       ;;
   esac
+
+  echo "==> Deploying Claude Code panel..."
+  bash "$dir/claude-panel-setup.sh"
 
   echo
   echo "Deploy complete."
