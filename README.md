@@ -1,4 +1,4 @@
-# AI Agent Cost & Usage Panel
+# Claude Code Cost & Usage Panel
 
 Live, always-visible cost and token tracking for **Claude Code** and **OpenCode**, running in a right-hand [Ghostty](https://ghostty.org/) split next to your terminal session — so you can watch what a coding agent is actually costing you, turn by turn, instead of finding out at the end of the month.
 

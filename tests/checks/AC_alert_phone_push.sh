@@ -16,7 +16,7 @@ check_AC_alert_phone_push() {
 
   printf '%s\n' '{"sessions":[{"period":"S1","totalCost":8.0},{"period":"S2","totalCost":8.0},{"period":"S3","totalCost":8.6},{"period":"SID-AC","totalCost":42.13}]}' \
     > "$CCUSAGE_FIXTURE_DIR/session.json"
-  local payload='{"session_id":"SID-AC","cwd":"/Users/x/Desktop/github/ai-agent-cost-usage-panel"}'
+  local payload='{"session_id":"SID-AC","cwd":"/Users/x/Desktop/github/claudecode-cost-usage-panel"}'
 
   # A capturing curl, so the check exercises the real send path without
   # sending anything. Ahead of the sandbox's stub dir on PATH.
@@ -71,7 +71,7 @@ STUB
   assert_contains "with the figure" '$42.13' "$sent"
   # Several sessions run at once here; a push that does not say which one it
   # is about cannot be acted on from a phone.
-  assert_contains "and says which project" "ai-agent-cost-usage-panel" "$sent"
+  assert_contains "and says which project" "claudecode-cost-usage-panel" "$sent"
   assert_contains "and which session" "session: SID-AC" "$sent"
 
   # The body travels in a file, not on the argv, so it never shows up in

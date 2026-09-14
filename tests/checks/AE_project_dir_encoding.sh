@@ -98,15 +98,17 @@ check_AE_project_dir_encoding() {
   plain=$(strip_ansi "$frame")
   assert_contains "the header names the resolved model" "Model: Opus 5" "$plain"
   assert_not_contains "and no longer says Unknown" "Model: Unknown" "$plain"
-  # This one carries no colour boundary inside it, so it is safe either way
-  # -- and it is one of the two lines the frozen pane actually showed.
+  # One of the two lines the frozen pane actually showed.
   assert_not_contains "and does not report the context as unknowable" \
     "Context Usage: N/A" "$plain"
   # The third casualty of the same key: `ls "$project_dir"/*.jsonl` supplies
   # the session ids that the folder's spend is summed over, so a directory
   # that does not exist printed $0.00 against a session that had spent $26.
+  # Stripped, like the model assertion above: the folder NAME is printed
+  # wrapped in electric blue, so a colour boundary sits between "Folder: "
+  # and "proj dir" in the raw frame and the whole row never matches there.
   assert_contains "and the folder's spend is its sessions', not \$0" \
-    "Folder: proj dir (\$26)" "$frame"
+    "Folder: proj dir (\$26)" "$plain"
 
   local table; table=$(build_session_table 2>/dev/null)
   assert_not_contains "and This Session is not permanently empty" \

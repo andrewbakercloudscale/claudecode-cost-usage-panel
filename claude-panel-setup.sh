@@ -2381,33 +2381,67 @@ build_summary() {
     printf '  🤖 Model: %s%s%s  SID: %s%s%s\n' \
       "$mtc" "${model_label:-Unknown}" "$C_RESET" \
       "$C_ELECTRIC" "${sess_id: -5}" "$C_RESET"
-
-    if [ -n "$SESS_COST" ]; then
-      sess_amt=$(awk -v c="$SESS_COST" 'BEGIN{ printf "%.2f", c }')
-      sc=$(tier_color "$sess_amt" "$avg_session_cost" "$TIER_YELLOW_MULT" "$TIER_RED_MULT" "$MIN_SESSION_ALERT")
-      # THIS session's own $/hr (spend so far ÷ time since its first
-      # message) — separate from the block burn rate below, which is
-      # every session's combined spend in the current 5h window, not
-      # just this one. Shown on the same row as the spend it's derived
-      # from rather than its own line.
-      sess_rate=$(awk -v c="$sess_amt" -v h="$sess_elapsed_h" 'BEGIN{ printf "%.2f", c/h }')
-      src=$(threshold_color "$sess_rate" "$BURN_YELLOW" "$BURN_RED")
-      printf '  💰 Session: %s$%s%s, Burn %s$%s/hr%s\n' \
-        "$sc" "$sess_amt" "$C_RESET" "$src" "$sess_rate" "$C_RESET"
-    else
-      # The parse produced no metadata line (a pre-existing cache entry, or
-      # a session with no priced turns yet). Say so rather than print a
-      # figure that would be indistinguishable from a real $0.00.
-      printf '  💰 Session: --, Burn --\n'
-    fi
   else
     printf '  🤖 Model: %sUnknown%s\n' "$C_YELLOW" "$C_RESET"
-    # "--", the same as the no-metadata branch above, and for the same
-    # reason it gives there: with no session resolved there is no figure to
-    # print, and `$-0.00` reads as one. It was the only money-shaped string
-    # on screen during the staleness this file's project_key() comment
-    # describes, so the one row that should have said "I know nothing" was
-    # the row that looked most like an answer.
+  fi
+
+  # Directly under Model, not down among the money rows where it used to
+  # sit. Model/SID/Folder all answer "what is this pane watching"; Session,
+  # Today, Block, 30-Day all answer "how much has it cost". Folder was the
+  # one identity row stranded on the wrong side of that split, five money
+  # lines away from the two it belongs with.
+  #
+  # Show just the project folder name — the transcript's own "cwd" field
+  # when a session is resolved (not Claude Code's sanitized full-path
+  # directory name, which can run well past a narrow 1/3-width split), or
+  # $PWD's own basename otherwise, since this panel is always launched
+  # into a same-cwd split either way.
+  if [ -n "$latest" ]; then
+    folder_disp="${folder_name:-unknown}"
+  else
+    folder_disp="$(basename "$PWD")"
+  fi
+  folder_maxw=$(( cols - 12 )); (( folder_maxw < 10 )) && folder_maxw=10
+  if [ "${#folder_disp}" -gt "$folder_maxw" ]; then
+    folder_disp="${folder_disp:0:$((folder_maxw - 3))}..."
+  fi
+  # Total spend attributed to THIS project — every session whose
+  # transcript lives under $project_dir, summed via ccusage's own
+  # per-session costs (not a token-repricing estimate) — shown next to
+  # the folder name rather than the account-wide block projection that
+  # used to sit here. $project_dir needs no resolved session either.
+  proj_ids_json=$(ls "$project_dir"/*.jsonl 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.jsonl$//' | jq -R -s -c 'split("\n") | map(select(length>0))')
+  proj_spend=$(printf '%s' "$all_sess" | jq -r --argjson ids "$proj_ids_json" '
+    [.session[] | select(.period as $p | $ids | index($p) != null) | .totalCost] | add // 0
+  ')
+  # Electric blue on the name, for the same reason SID carries it: these are
+  # strings you go looking for, not numbers you watch move, and the colour is
+  # what separates the identity rows from the tier-coloured money below them.
+  # The spend stays uncoloured — it has no threshold to be coloured against.
+  printf '  📁 Folder: %s%s%s (%s)\n' "$C_ELECTRIC" "$folder_disp" "$C_RESET" "$(fmt_money "$proj_spend")"
+
+  # Session spend needs BOTH a resolved session and a priced turn in it;
+  # the two used to be nested, which is why the "--" fallback had to be
+  # written out twice with near-identical reasoning attached to each.
+  if [ -n "$latest" ] && [ -n "$SESS_COST" ]; then
+    sess_amt=$(awk -v c="$SESS_COST" 'BEGIN{ printf "%.2f", c }')
+    sc=$(tier_color "$sess_amt" "$avg_session_cost" "$TIER_YELLOW_MULT" "$TIER_RED_MULT" "$MIN_SESSION_ALERT")
+    # THIS session's own $/hr (spend so far ÷ time since its first
+    # message) — separate from the block burn rate below, which is
+    # every session's combined spend in the current 5h window, not
+    # just this one. Shown on the same row as the spend it's derived
+    # from rather than its own line.
+    sess_rate=$(awk -v c="$sess_amt" -v h="$sess_elapsed_h" 'BEGIN{ printf "%.2f", c/h }')
+    src=$(threshold_color "$sess_rate" "$BURN_YELLOW" "$BURN_RED")
+    printf '  💰 Session: %s$%s%s, Burn %s$%s/hr%s\n' \
+      "$sc" "$sess_amt" "$C_RESET" "$src" "$sess_rate" "$C_RESET"
+  else
+    # No session resolved, or one with no metadata line yet (a pre-existing
+    # cache entry, or a first turn that has not landed). "--" is the honest
+    # answer: `$0.00` would be indistinguishable from a real zero. It was the
+    # only money-shaped string on screen during the staleness this file's
+    # project_key() comment describes, so the one row that should have said
+    # "I know nothing" was the row that looked most like an answer.
     printf '  💰 Session: --, Burn --\n'
   fi
 
@@ -2466,30 +2500,6 @@ build_summary() {
     printf '  🧠 Context Usage: N/A\n'
   fi
 
-  # Show just the project folder name — the transcript's own "cwd" field
-  # when a session is resolved (not Claude Code's sanitized full-path
-  # directory name, which can run well past a narrow 1/3-width split), or
-  # $PWD's own basename otherwise, since this panel is always launched
-  # into a same-cwd split either way.
-  if [ -n "$latest" ]; then
-    folder_disp="${folder_name:-unknown}"
-  else
-    folder_disp="$(basename "$PWD")"
-  fi
-  folder_maxw=$(( cols - 12 )); (( folder_maxw < 10 )) && folder_maxw=10
-  if [ "${#folder_disp}" -gt "$folder_maxw" ]; then
-    folder_disp="${folder_disp:0:$((folder_maxw - 3))}..."
-  fi
-  # Total spend attributed to THIS project — every session whose
-  # transcript lives under $project_dir, summed via ccusage's own
-  # per-session costs (not a token-repricing estimate) — shown next to
-  # the folder name rather than the account-wide block projection that
-  # used to sit here. $project_dir needs no resolved session either.
-  proj_ids_json=$(ls "$project_dir"/*.jsonl 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.jsonl$//' | jq -R -s -c 'split("\n") | map(select(length>0))')
-  proj_spend=$(printf '%s' "$all_sess" | jq -r --argjson ids "$proj_ids_json" '
-    [.session[] | select(.period as $p | $ids | index($p) != null) | .totalCost] | add // 0
-  ')
-  printf '  📁 Folder: %s (%s)\n' "$folder_disp" "$(fmt_money "$proj_spend")"
   # Both trend lines below are colored against the SAME window one period
   # earlier (this week's avg vs last week's, this month's spend vs last
   # month's) — a baseline has no natural threshold of its own, but a
