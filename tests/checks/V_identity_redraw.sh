@@ -29,11 +29,12 @@
 check_V_identity_redraw() {
   sandbox_new V
   # resolve_session derives its project directory from $PWD (Claude Code
-  # encodes a project's transcript dir as its cwd with "/" replaced by "-"),
-  # so build the directory the panel will ACTUALLY look in rather than
-  # assigning $latest by hand. That keeps the pinned-session path itself
-  # under test instead of stubbed around.
-  local proj_dir="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr '/' '-')"
+  # encodes a project's transcript dir as its cwd with every character
+  # outside [A-Za-z0-9] replaced by "-" -- see check AE), so build the
+  # directory the panel will ACTUALLY look in rather than assigning $latest
+  # by hand. That keeps the pinned-session path itself under test instead of
+  # stubbed around.
+  local proj_dir="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr -c 'a-zA-Z0-9' '-')"
   mkdir -p "$proj_dir"
   local sid="sess-v" f="$proj_dir/sess-v.jsonl"
   local today; today=$(date +%Y-%m-%d)
@@ -79,7 +80,12 @@ check_V_identity_redraw() {
   # And the frame the loop would then render says so.
   local frame; frame=$(build_summary 2>/dev/null)
   assert_contains "the redrawn header names the model" "Opus 5" "$frame"
-  assert_not_contains "and no longer says Unknown" "Model: Unknown" "$frame"
+  # Through strip_ansi, because the frame this used to be asserted against
+  # raw: the model is printed wrapped in its tier colour, so the literal
+  # "Model: Unknown" never appeared in any frame and the assertion could not
+  # fail on any panel. See strip_ansi in the harness.
+  assert_not_contains "and no longer says Unknown" \
+    "Model: Unknown" "$(strip_ansi "$frame")"
 
   # Once rendered, the identity is no longer a reason to redraw -- otherwise
   # every tick would be a slow tick for the rest of the session, quietly

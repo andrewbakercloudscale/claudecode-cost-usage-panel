@@ -21,7 +21,7 @@
 check_W_pin_recovery() {
   sandbox_new W
   local proj tp
-  proj="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr '/' '-')"
+  proj="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr -c 'a-zA-Z0-9' '-')"
   mkdir -p "$proj"
   tp="$proj/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
 

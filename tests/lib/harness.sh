@@ -22,6 +22,21 @@ _fail() {
   FAILED=1
 }
 
+# Drop SGR escapes so a check can assert on a frame's TEXT.
+#
+# Rule 1 of this file, in its subtlest form. Almost every label in the panel
+# is printed with its VALUE wrapped in a colour -- `Model: <esc>[33mUnknown`,
+# `Session: <esc>[32m$4.10` -- so the literal string "Model: Unknown" does
+# not occur in any frame the panel can emit, resolved or not. An
+# assert_not_contains for it therefore passes on every panel ever built,
+# including a totally broken one, while reading as though it caught
+# something. Check V shipped exactly that assertion and it never once could
+# have failed.
+#
+# So: assert on stripped text, or assert on a substring that carries no
+# colour boundary inside it. Never on the absence of a label+value pair.
+strip_ansi() { printf '%s' "$1" | LC_ALL=C sed "s/$(printf '\033')\[[0-9;]*m//g"; }
+
 assert_eq() { # $1 label, $2 expected, $3 actual
   if [ "$2" = "$3" ]; then _pass; else _fail "$1" "$2" "$3"; fi
 }

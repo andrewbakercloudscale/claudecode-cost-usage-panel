@@ -54,10 +54,11 @@ check_I_unknown_model() {
   # reason other than the one it names.
   #
   # resolve_session only looks in the transcript directory Claude Code would
-  # use for THIS cwd (its path is $PWD with "/" replaced by "-"), so the
+  # use for THIS cwd (its path is $PWD with every character outside
+  # [A-Za-z0-9] replaced by "-" -- see check AE), so the
   # transcript is placed there and found by the panel's own resolution
   # rather than assigned to $latest by hand -- same reasoning as check V.
-  local proj_dir="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr '/' '-')"
+  local proj_dir="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr -c 'a-zA-Z0-9' '-')"
   mkdir -p "$proj_dir"
   cp "$tp" "$proj_dir/sess-i.jsonl"
   load_panel 10 12 "sess-i"

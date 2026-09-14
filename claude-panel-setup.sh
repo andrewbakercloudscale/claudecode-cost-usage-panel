@@ -2050,6 +2050,41 @@ adopt_handoff_pin() {
   PIN_SOURCE="handoff"
 }
 
+# ---- a path, as Claude Code names its transcript directory ----
+# Claude Code encodes a session's cwd into a directory name under
+# ~/.claude/projects by replacing EVERY character outside [A-Za-z0-9] with a
+# "-", one for one, with no collapsing of runs:
+#   /Users/me/Desktop/github/iphone Image Manager
+#     -> -Users-me-Desktop-github-iphone-Image-Manager
+#   /Users/me/websites/easyenglishlessons.com
+#     -> -Users-me-websites-easyenglishlessons-com
+#
+# This used to be `tr '/' '-'`, which is the same answer for a path made of
+# nothing but letters, digits and slashes -- which most of them are, so it
+# was right for every project on this machine but two. For the other two it
+# named a directory that does not exist, and a directory that does not exist
+# is indistinguishable here from a project with no sessions: $latest stayed
+# empty forever, so "This Session" said "(no active Claude Code session
+# found)" and the header said Model: Unknown / Context Usage: N/A / Session:
+# -- for the entire life of the pane, while every account-wide figure beside
+# them (Today, Block, Recent, Top Sessions -- all corpus-wide globs, which
+# never needed this key) updated normally. That is the shape of the bug as
+# reported: not a panel that stopped, a panel where SOME sections are frozen
+# and the rest are live. `📁 Folder (…)` was the third casualty, printing $0
+# against a session that had spent $26, because its per-project session list
+# is `ls "$project_dir"/*.jsonl`.
+#
+# Verified against all 43 project directories on this machine by re-deriving
+# each one from the `cwd` recorded inside its own transcripts: 22 carried a
+# cwd, this rule reproduces 22 of 22, the old rule 20.
+#
+# NOT shared with the pin-file key (PIN_HANDOFF_FILE, and the SessionStart
+# hook and launcher that write it). That key names a file in OUR OWN cache
+# directory; the three sites that build it agree with each other, nothing
+# outside reads it, and a space in a filename is not a bug. Do not "fix" it
+# to match this one without changing all three at once.
+project_key() { printf '%s' "$1" | tr -c 'a-zA-Z0-9' '-'; }
+
 # ---- which transcript is this pane's session? ----
 # Runs on every FAST tick: a session started in this pane after the panel
 # has to appear in the turn table now, not on the next slow tier. It sets
@@ -2083,9 +2118,9 @@ resolve_session() {
   # refreshes (e.g. jumping from turn 50 in this project back to turn 16
   # in another one). The launcher (claude-panel-launch.sh) always opens
   # this panel via a same-cwd Ghostty split, so $PWD reliably names the
-  # project this panel belongs to; Claude Code encodes that project's
-  # transcript directory as $PWD with every "/" replaced by "-".
-  project_dir="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr '/' '-')"
+  # project this panel belongs to; project_key() above turns that into the
+  # directory name Claude Code actually used.
+  project_dir="$HOME/.claude/projects/$(project_key "$PWD")"
   # Every tick, not just at startup. The panel and `claude` start at the
   # same moment (the ~/.zshrc preexec hook backgrounds the launcher and then
   # lets the command run), so on the first few ticks the SessionStart hook
@@ -2367,7 +2402,13 @@ build_summary() {
     fi
   else
     printf '  🤖 Model: %sUnknown%s\n' "$C_YELLOW" "$C_RESET"
-    printf '  💰 Session: $-0.00, Burn $0.00/hr\n'
+    # "--", the same as the no-metadata branch above, and for the same
+    # reason it gives there: with no session resolved there is no figure to
+    # print, and `$-0.00` reads as one. It was the only money-shaped string
+    # on screen during the staleness this file's project_key() comment
+    # describes, so the one row that should have said "I know nothing" was
+    # the row that looked most like an answer.
+    printf '  💰 Session: --, Burn --\n'
   fi
 
   tc=$(tier_color "$today_amt" "$avg_daily_30" "$TIER_YELLOW_MULT" "$TIER_RED_MULT" "$MIN_DAILY_ALERT")

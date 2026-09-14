@@ -23,7 +23,7 @@
 check_AA_pane_pin() {
   sandbox_new AA
   local proj mine theirs dirpin pinsdir panedir
-  proj="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr '/' '-')"
+  proj="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr -c 'a-zA-Z0-9' '-')"
   mkdir -p "$proj"
   dirpin="$HOME/.cache/claude-panel-pin/$(printf '%s' "$PWD" | tr '/' '-')"
   pinsdir="$HOME/.cache/claude-panel-pin/tty"

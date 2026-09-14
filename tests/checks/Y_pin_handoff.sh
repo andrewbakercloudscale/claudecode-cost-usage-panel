@@ -19,7 +19,7 @@
 check_Y_pin_handoff() {
   sandbox_new Y
   local proj live old handoff
-  proj="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr '/' '-')"
+  proj="$HOME/.claude/projects/$(printf '%s' "$PWD" | tr -c 'a-zA-Z0-9' '-')"
   mkdir -p "$proj" "$HOME/.cache/claude-panel-pin"
   handoff="$HOME/.cache/claude-panel-pin/$(printf '%s' "$PWD" | tr '/' '-')"
   live="$proj/aaaaaaaa-1111-2222-3333-444444444444.jsonl"
