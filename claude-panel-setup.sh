@@ -1693,15 +1693,27 @@ if shown:
         # below 95% red, below 90% purple, 95%+ reads as normal.
         cache_c = col_purple if cache_pct < 90 else (col_cost if cache_pct < 95 else col_input)
         ctx_c, delta_c = ctx_pct_color(ctx_pct), delta_color(delta, avg_delta)
-        # Whole-row coloring is keyed on delta alone, not context %. Delta
-        # is a one-turn spike -- an actionable, out-of-pattern event worth
-        # flagging everywhere at a glance. Context % is the opposite: once
-        # a long session crosses its threshold it STAYS crossed for every
-        # remaining turn (it only grows), so letting it drive whole-row
-        # color painted the rest of a deep Opus/long session's table solid
-        # red/purple turn after turn -- true, but no longer signal, just
-        # noise. Context % keeps its own dedicated Input-cell tint below.
-        rank = severity_rank(delta_c)
+        # Whole-row coloring takes the worse of the two signals, with one
+        # asymmetry: a delta spike colors the row at any band it reaches,
+        # context % only from RED up (CTX_RED, 60%) -- yellow stays a
+        # single-cell tint.
+        #
+        # This used to key on delta ALONE. The argument was that context %
+        # only grows, so once a long session crosses a threshold every
+        # remaining row is painted and the color stops being signal. That
+        # is true and it is also the wrong trade: the quiet version was
+        # missed in practice at 96% of a 1M window -- a whole table of rows
+        # whose Input cell was tinted purple and whose other four columns
+        # read perfectly normal, i.e. exactly what "nothing to see here"
+        # looks like from across the room. A table that goes solid purple
+        # for the rest of a session is the intended behaviour, not the
+        # failure mode; the session really is about to be compacted, and
+        # that is worth one loud table rather than one quiet cell. Yellow
+        # is left alone because 40% of a window is routine and painting
+        # from there would put most sessions in permanent color, which is
+        # the noise case the old comment was actually describing.
+        ctx_rank = severity_rank(ctx_c)
+        rank = max(severity_rank(delta_c), ctx_rank if ctx_rank >= 2 else 0)
         cost_cell = "$" + format(cost, ".2f")
         if rank > 0:
             row_c = (col_input, col_mid_tier, col_cost, col_purple)[rank]
@@ -2628,8 +2640,15 @@ build_summary() {
       if [ "$win_size" = "200000" ] && [ "$model_id" != "claude-haiku-4-5" ] && [ "${CLAUDE_CODE_DISABLE_1M_CONTEXT:-0}" = "1" ]; then
         forced_note=" [forced 200k]"
       fi
-      printf '  🧠 Context Usage: %s%s / %s tokens (%s%%)%s%s\n' \
-        "$ctx_color" "$(fmt_m "$ctx_tokens")" "$(fmt_m "$win_size")" "$ctx_pct" "$C_RESET" "$forced_note"
+      # From CTX_RED up the label goes with it, same rule as the turn
+      # table's whole-row coloring: a coloured figure after a plain white
+      # "Context Usage:" is what got scanned past at 96% of a 1M window.
+      # Below that only the figure is tinted, so a routine yellow does not
+      # make the whole header line shout.
+      label_color=""
+      awk -v v="$ctx_pct" -v t="$CTX_RED" 'BEGIN{exit !(v+0>t)}' && label_color="$ctx_color"
+      printf '  %s🧠 Context Usage: %s%s / %s tokens (%s%%)%s%s\n' \
+        "$label_color" "$ctx_color" "$(fmt_m "$ctx_tokens")" "$(fmt_m "$win_size")" "$ctx_pct" "$C_RESET" "$forced_note"
     else
       # No context figure from the parse -- a session whose first turn has
       # not landed yet, or an older cache entry. "N/A" is the honest answer;
