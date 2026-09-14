@@ -232,6 +232,29 @@ PIN_HANDOFF_FRESH_SECS="${PANEL_PIN_FRESH:-180}"
 # How recently the transcript a STALE handoff names must have been written
 # for the panel to believe that session is the one in this pane.
 PIN_HANDOFF_LIVE_SECS="${PANEL_PIN_LIVE:-1800}"
+# ...and how long an ALREADY ADOPTED pin may go without its transcript being
+# written to before the panel stops believing it. Same figure, deliberately:
+# the adoption test and the retention test are the same question asked at two
+# different moments, and a pin that would not be adopted now has no business
+# still being held.
+#
+# Nothing used to ask the second question. A pin was tested for liveness once,
+# at adoption, and then kept for the life of the pane whatever happened to the
+# session it named — so a pin adopted from a session that ran for ninety
+# seconds and stopped was still being reported as this pane's forty minutes
+# later, model line, cost, burn rate, context percentage and turn table
+# included. Releasing it is not a guess about which session is right; it is
+# the panel declining to keep asserting one that is demonstrably over.
+PIN_DEAD_SECS="${PANEL_PIN_DEAD:-$PIN_HANDOFF_LIVE_SECS}"
+# The id of the pin released that way, so adopt_handoff_pin does not simply
+# read it back out of the same unchanged file on the next tick and flap.
+# Cleared when anything else is adopted; a released session that starts
+# writing again is admitted through the ordinary liveness test below.
+PIN_RELEASED_SID=""
+# The last "directory pin stood aside for a pane pin" decision logged, as
+# "<declined sid>><adopted sid>", so that steady state is recorded once
+# rather than on every refresh for the life of the pane.
+PIN_DECLINE_MEMO=""
 is_uuid() {
   case "$1" in
     [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
@@ -1993,8 +2016,35 @@ learn_pane_pairing() {
   pin_log "paired: panel tty ${PANEL_TTY:-none} -> claude tty $ctty (reading $PIN_PANE_PIN_FILE)"
 }
 
+# ---- stop believing a pin whose session is over ----
+# Called once per tick, immediately before adoption, so a released pin can be
+# replaced on the same tick it is dropped.
+#
+# Pane pins are exempt: their key IS the pane, so a quiet transcript there
+# means the person at that keyboard is reading rather than typing, and there
+# is nothing better to replace it with. The two sources this does apply to
+# are the ones that only ever inferred this pane's session — an argv pin
+# predicted by the launcher before the session existed, and a directory-keyed
+# handoff that any other session in the repo can overwrite.
+release_dead_pin() {
+  local tsc age
+  [ -n "$PIN_SESSION_ID" ] || return 0
+  [ "$PIN_SOURCE" = "pane" ] && return 0
+  tsc="$project_dir/$PIN_SESSION_ID.jsonl"
+  # No transcript at all is a different condition with a different answer
+  # (the grace period in resolve_session); this is only about one that
+  # exists and has gone cold.
+  [ -f "$tsc" ] || return 0
+  age=$(( $(panel_now) - $(stat -f %m "$tsc" 2>/dev/null || stat -c %Y "$tsc" 2>/dev/null || echo 0) ))
+  (( age > PIN_DEAD_SECS )) || return 0
+  pin_log "releasing $PIN_SOURCE pin '$PIN_SESSION_ID': its transcript has not been written to for ${age}s (limit ${PIN_DEAD_SECS}s)"
+  PIN_RELEASED_SID="$PIN_SESSION_ID"
+  PIN_SESSION_ID=""
+  PIN_SOURCE=""
+}
+
 adopt_handoff_pin() {
-  local sid written age tsc now
+  local sid written age tsc now lone
   # An argv pin is the caller being explicit; do not second-guess it until
   # resolve_session has given up on it and cleared PIN_SOURCE.
   [ "$PIN_SOURCE" = "argv" ] && return 0
@@ -2012,6 +2062,7 @@ adopt_handoff_pin() {
     pin_log "adopting pane pin '$sid' for claude tty $PANE_CLAUDE_TTY"
     PIN_SESSION_ID="$sid"
     PIN_SOURCE="pane"
+    PIN_RELEASED_SID=""
     return 0
   fi
   # Paired, but the pin file is not there yet (claude has not reached its
@@ -2025,6 +2076,15 @@ adopt_handoff_pin() {
   [ "$sid" = "$PIN_SESSION_ID" ] && return 0
   case "${written:-}" in ''|*[!0-9]*) written=0 ;; esac
   now=$(panel_now)
+  # A sid this panel has just released is not re-adopted on the strength of
+  # the file that named it in the first place — that file has not changed,
+  # and reading it again is not new evidence. It is sent down the stale path
+  # instead, where it has to prove its transcript is being written to again:
+  # the same test that released it, so a genuinely resumed session comes
+  # back and a finished one does not.
+  if [ "$sid" = "$PIN_RELEASED_SID" ]; then
+    written=0
+  fi
   # Two-sided, and the second side is the one that was missing. A handoff
   # written LONG AFTER this panel started was not written for this launch —
   # it is another pane opening in the same directory — so it belongs on the
@@ -2042,12 +2102,90 @@ adopt_handoff_pin() {
     [ -f "$tsc" ] || return 0
     age=$(( now - $(stat -f %m "$tsc" 2>/dev/null || echo 0) ))
     (( age >= 0 && age <= PIN_HANDOFF_LIVE_SECS )) || return 0
+    # "Live" here is a half-hour window, which is generous by design — a
+    # pane can sit unread that long. It is far too generous to outrank a
+    # session being written to right now: this file names a REPO, and a tty
+    # pin names a PANE in it. So if there is exactly one live pane session
+    # here and this is not it, stand aside rather than answer with the
+    # weaker claim. (If this sid IS live it has a tty pin of its own, which
+    # makes two candidates, which is no answer — and this branch keeps it.)
+    lone=$(lone_live_pane_session) || lone=""
+    if [ -n "$lone" ] && [ "$lone" != "$sid" ]; then
+      # Once per decision, not once per tick. This one is reached on every
+      # refresh for as long as both files disagree -- which is the ordinary
+      # steady state after it fires, not an event -- and at one line every
+      # ten seconds it would bury the log this whole mechanism is debugged
+      # from within a day.
+      if [ "$PIN_DECLINE_MEMO" != "$sid>$lone" ]; then
+        PIN_DECLINE_MEMO="$sid>$lone"
+        pin_log "declining unaligned handoff pin '$sid' (transcript touched ${age}s ago): '$lone' is the only live pane session in $project_dir"
+      fi
+      return 0
+    fi
     pin_log "adopting unaligned handoff pin '$sid' (written $(( now - written ))s ago, panel started $(( now - PANEL_START_EPOCH ))s ago, transcript touched ${age}s ago)"
   else
     pin_log "adopting handoff pin '$sid' for $PWD"
   fi
   PIN_SESSION_ID="$sid"
   PIN_SOURCE="handoff"
+  PIN_RELEASED_SID=""
+}
+
+# ---- last resort: the only live pane session in this project ----
+# Reached when nothing has addressed this panel directly — no launcher
+# pairing, and no directory handoff that survives the liveness test — and it
+# is reached far more often than it should be, because the launcher writes
+# its pairing from a `pgrep` that does not always find the panel in time.
+# An unpaired panel restarted into a conversation already in progress is
+# structurally blind: the birth-time heuristic below only ever accepts a
+# transcript born AFTER the panel started, so the pane reports "no active
+# Claude Code session found" for as long as it stays open, beside a session
+# it can see perfectly well.
+#
+# The claim made here is narrow, and the evidence is pins that already exist.
+# Every entry under tty/ was written by the SessionStart hook for a claude
+# with a controlling terminal — a real pane, never a `--print` run. So a sid
+# found there whose transcript is in THIS project directory and is still
+# being written to is a live pane session in this repo. Exactly one of those
+# and this panel is beside it. Two, and that is the ambiguity this file
+# refuses to resolve by guessing: the pane stays honestly blind and says so
+# in the log.
+# Prints that sole live pane session's id, or nothing. Split out from the
+# adopter below because adopt_handoff_pin consults it too: a directory-keyed
+# pin only ever names a REPO, so when it names a session that is not the one
+# live pane session in that repo, it is the weaker of the two claims and
+# stands aside.
+lone_live_pane_session() {
+  local f sid tsc age now found=""
+  # A paired panel already knows which pane is its own; if that pin is not
+  # there yet, the answer is to wait for it, not to go looking for someone
+  # else's.
+  [ -n "$PANE_CLAUDE_TTY" ] && return 0
+  now=$(panel_now)
+  for f in "$PIN_TTY_DIR"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r sid _ < "$f" 2>/dev/null || continue
+    is_uuid "${sid:-}" || continue
+    tsc="$project_dir/$sid.jsonl"
+    [ -f "$tsc" ] || continue
+    age=$(( now - $(stat -f %m "$tsc" 2>/dev/null || stat -c %Y "$tsc" 2>/dev/null || echo 0) ))
+    (( age >= 0 && age <= PIN_HANDOFF_LIVE_SECS )) || continue
+    # A second candidate is ambiguity, not a better answer.
+    [ -n "$found" ] && return 0
+    found="$sid"
+  done
+  [ -n "$found" ] || return 1
+  printf '%s' "$found"
+}
+
+adopt_lone_live_pane_session() {
+  local found
+  found=$(lone_live_pane_session) || return 0
+  [ -n "$found" ] || return 0
+  pin_log "adopting '$found' as the only live pane session in $project_dir"
+  PIN_SESSION_ID="$found"
+  PIN_SOURCE="sole-live"
+  PIN_RELEASED_SID=""
 }
 
 # ---- a path, as Claude Code names its transcript directory ----
@@ -2127,7 +2265,9 @@ resolve_session() {
   # may not have written the handoff yet. This also re-reads it while a pin
   # is held but unresolved, so the authoritative id from the hook supersedes
   # the launcher's guess if the two ever disagree.
+  release_dead_pin
   adopt_handoff_pin
+  [ -z "$PIN_SESSION_ID" ] && adopt_lone_live_pane_session
   if [ -n "$PIN_SESSION_ID" ]; then
     latest="$project_dir/$PIN_SESSION_ID.jsonl"
     # The pinned session may not have written its first line yet (the
@@ -3035,22 +3175,54 @@ mkdir -p "$PIN_DIR" 2>/dev/null || exit 0
 # follows whichever started last.
 #
 # The hook process itself has NO controlling terminal: Claude Code gives it
-# pipes, so `ps -o tty= -p $$` prints "??". Its parent — claude — has one,
-# inherited from the pane. Walk up rather than trust $PPID to be claude
-# itself, so a wrapper shell between the two costs nothing.
-owner_tty() {
-  local p="$$" t i
-  for i in 1 2 3 4 5; do
+# pipes, so `ps -o tty= -p $$` prints "??". So walk up — but stop at the
+# FIRST claude in the ancestry, the one that ran this hook, and answer with
+# that process's terminal or with nothing.
+#
+# The first version stopped at the first process with ANY terminal instead.
+# For an interactive pane that is claude, one level up, and it is right. For
+# a HEADLESS claude — `claude --print`, which is how the standards-review
+# sections and every build script that shells out to the CLI run — it walks
+# straight past the terminal-less claude and returns the terminal of the
+# interactive shell that started the build. Observed 2026-09-14: a build's
+# review sections wrote pins naming a 7-turn Sonnet session against the pane
+# of the Opus session that launched them, and that repo's panel spent the
+# afternoon reporting the review's model, cost and context as its own.
+#
+# A claude with no controlling terminal is in no pane. That is the whole
+# answer: it is nobody's pane session, so it writes NEITHER pin and the
+# panels in that directory are left alone.
+session_tty() {
+  local p="$$" t comm i
+  for i in 1 2 3 4 5 6 7 8; do
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')
     [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ] || return 1
+    comm=$(ps -o comm= -p "$p" 2>/dev/null | tr -d '[:space:]')
+    # A wrapper shell between the hook and claude costs nothing; keep going.
+    case "${comm##*/}" in
+      claude|claude-code) ;;
+      *) continue ;;
+    esac
     t=$(ps -o tty= -p "$p" 2>/dev/null | tr -d '[:space:]')
     case "$t" in
-      ''|'??') ;;
+      ''|'??') return 1 ;;
       *) printf '%s' "$t"; return 0 ;;
     esac
-    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')
   done
   return 1
 }
+
+# Both pins are gated on the pane, and this is the gate: no terminal, no
+# pane, no pin. It is checked BEFORE the directory write rather than only
+# for the tty one — the directory key is the channel a headless session
+# hijacked, because every panel in a repo reads it and nothing about it says
+# which pane it was written for.
+ctty=$(session_tty) || ctty=""
+if [ -z "$ctty" ]; then
+  printf '%s [%s] SessionStart: %s (no controlling terminal — headless claude, or no claude in this hook'"'"'s ancestry) -> %s, no pin written\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$cwd" "$sid" >> "$LOG" 2>/dev/null
+  exit 0
+fi
 
 key=$(printf '%s' "$cwd" | tr '/' '-')
 tmp="$PIN_DIR/.$key.$$"
@@ -3062,16 +3234,13 @@ rm -f "$tmp" 2>/dev/null
 # instead of it: a panel that has no pairing (started by hand, or through a
 # path with no launcher) still needs the directory file, and a panel that
 # does have one ignores it.
-ctty=$(owner_tty) || ctty=""
-if [ -n "$ctty" ]; then
-  mkdir -p "$PIN_DIR/tty" 2>/dev/null
-  tmp="$PIN_DIR/tty/.$ctty.$$"
-  printf '%s\t%s\n' "$sid" "$(date +%s)" > "$tmp" 2>/dev/null &&
-    mv -f "$tmp" "$PIN_DIR/tty/$ctty" 2>/dev/null
-  rm -f "$tmp" 2>/dev/null
-fi
+mkdir -p "$PIN_DIR/tty" 2>/dev/null
+tmp="$PIN_DIR/tty/.$ctty.$$"
+printf '%s\t%s\n' "$sid" "$(date +%s)" > "$tmp" 2>/dev/null &&
+  mv -f "$tmp" "$PIN_DIR/tty/$ctty" 2>/dev/null
+rm -f "$tmp" 2>/dev/null
 
-printf '%s [%s] SessionStart: %s (tty %s) -> %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$cwd" "${ctty:-none}" "$sid" >> "$LOG" 2>/dev/null
+printf '%s [%s] SessionStart: %s (tty %s) -> %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$cwd" "$ctty" "$sid" >> "$LOG" 2>/dev/null
 exit 0
 SESSHOOK_EOF
 chmod +x "$BIN_DIR/claude-panel-session-hook.sh"

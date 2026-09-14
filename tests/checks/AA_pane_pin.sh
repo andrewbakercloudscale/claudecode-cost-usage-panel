@@ -109,10 +109,21 @@ check_AA_pane_pin() {
   # Same shape, but the late pin names a session that IS live. That is a
   # second pane's session, and adopting it is how a panel spent a night
   # reporting another conversation's cost. It has to prove itself on the
-  # stale path, which a directory-keyed pin cannot do here -- the transcript
-  # is live, so this one IS adopted, and that is the honest limit of the
-  # fallback: only the pairing can tell these two apart. Assert the limit
-  # rather than pretend it isn't there.
+  # stale path, and a live transcript used to be all that took: the pin was
+  # adopted and the limit of the unpaired fallback was that it could not
+  # tell the two apart.
+  #
+  # It can tell them apart here now, on evidence it already had. cccccccc is
+  # live but nothing ever registered it as a PANE session -- no tty pin --
+  # while aaaaaaaa has one and is live, so aaaaaaaa is the only live pane
+  # session in this directory and the directory pin stands aside for it
+  # (check AG case 5). After check AF a live transcript with no tty pin is
+  # most likely a headless `--print` run, which is nobody's pane.
+  #
+  # The limit that remains is narrower: two siblings that BOTH registered a
+  # pane are two candidates, which is no answer, and an unpaired panel is
+  # back to the directory file (check AG case 6). Only the pairing settles
+  # that one.
   (
     PANEL_PANE_TTY=ttyTEST0 load_panel 10 12
     resolve_session
@@ -121,8 +132,22 @@ check_AA_pane_pin() {
     resolve_session
     printf '%s\n' "$PIN_SESSION_ID"
   ) > "$TEST_TMP/AA.late_live"
-  assert_eq "an unpaired panel cannot tell a live sibling session from its own" \
-    "cccccccc-1111-2222-3333-444444444444" "$(cat "$TEST_TMP/AA.late_live")"
+  assert_eq "a live sibling that never registered a pane does not displace this one" \
+    "aaaaaaaa-1111-2222-3333-444444444444" "$(cat "$TEST_TMP/AA.late_live")"
+  # ...and when it does register one, the ambiguity is real and is not
+  # resolved by guessing -- the directory pin answers, as before.
+  printf '%s\t%s\n' "cccccccc-1111-2222-3333-444444444444" "$(date +%s)" > "$pinsdir/ttyTEST2"
+  (
+    PANEL_PANE_TTY=ttyTEST0 load_panel 10 12
+    resolve_session
+    touch "$theirs"
+    printf '%s\t%s\n' "cccccccc-1111-2222-3333-444444444444" "$(( PANEL_START_EPOCH + 64800 ))" > "$dirpin"
+    resolve_session
+    printf '%s\n' "$PIN_SESSION_ID"
+  ) > "$TEST_TMP/AA.late_live2"
+  assert_eq "an unpaired panel still cannot tell two pane sessions apart" \
+    "cccccccc-1111-2222-3333-444444444444" "$(cat "$TEST_TMP/AA.late_live2")"
+  rm -f "$pinsdir/ttyTEST2"
 
   # ...but a PAIRED one can, which is the whole point.
   printf '%s\t%s\t%s\n' "ttyTEST1" "$$" "$(date +%s)" > "$panedir/ttyTEST0"
