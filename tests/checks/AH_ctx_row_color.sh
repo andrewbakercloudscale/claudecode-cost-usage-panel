@@ -8,10 +8,16 @@
 # and the entire "Context Usage" line, label included.
 #
 # Both halves of that are asserted here, and so is the half that must NOT
-# happen: yellow (40%) is routine and still tints only the one cell. Without
+# happen: yellow (>30%) is routine and still tints only the one cell. Without
 # the yellow case this check would pass just as happily against a panel that
 # painted every row in every session, which is the noise the old delta-only
 # rule was guarding against and is not what replaced it.
+#
+# The band edges are asserted too, at occupancies that land on DIFFERENT
+# sides of the old 40/60/80 bands than of today's 30/50/70: 55% is whole-row
+# red now and was a yellow cell before, 72% is purple now and was red. A
+# check written only at 95%/65%/45% passes under either set of thresholds and
+# would not notice them being quietly walked back up.
 check_AH_ctx_row_color() {
   local origin="$PWD"
 
@@ -77,6 +83,15 @@ check_AH_ctx_row_color() {
     assert_eq "a 95% turn row is purple end to end" "yes" "$(_ah_whole_row "$row" '[35m')"
   done <<< "$AH_ROWS"
 
+  # ---- 72%: purple begins at 70, not 80 -----------------------------------
+  _ah_render 715000
+  assert_contains "72% of a window is past the purple threshold" "(72%)" \
+    "$(strip_ansi "$AH_CTX_LINE")"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    assert_eq "a 72% turn row is purple end to end" "yes" "$(_ah_whole_row "$row" '[35m')"
+  done <<< "$AH_ROWS"
+
   # ---- 65%: red, same rule ------------------------------------------------
   _ah_render 645000
   case "$AH_CTX_LINE" in
@@ -88,9 +103,18 @@ check_AH_ctx_row_color() {
     assert_eq "a 65% turn row is red end to end" "yes" "$(_ah_whole_row "$row" '[31m')"
   done <<< "$AH_ROWS"
 
+  # ---- 55%: red begins at 50, not 60 --------------------------------------
+  _ah_render 545000
+  assert_contains "55% of a window is past the red threshold" "(55%)" \
+    "$(strip_ansi "$AH_CTX_LINE")"
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    assert_eq "a 55% turn row is red end to end" "yes" "$(_ah_whole_row "$row" '[31m')"
+  done <<< "$AH_ROWS"
+
   # ---- 45%: yellow stays a single cell ------------------------------------
-  # The counter-case. 40% of a window is an ordinary working session, and a
-  # panel that shouts here has stopped distinguishing anything.
+  # The counter-case. A third of a window is an ordinary working session, and
+  # a panel that shouts here has stopped distinguishing anything.
   _ah_render 445000
   case "$AH_CTX_LINE" in
     "  $(printf '\033')["*) assert_eq "a yellow context line leaves its label plain" "1" "0" ;;

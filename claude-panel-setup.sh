@@ -521,9 +521,15 @@ TIER_YELLOW_MULT=1.5
 TIER_RED_MULT=2.0
 BURN_YELLOW=3
 BURN_RED=6
-CTX_YELLOW=40
-CTX_RED=60
-CTX_PURPLE=80
+# Lowered from 40/60/80 on 14Sep26. At the old bands a 1M-window session
+# only turned red past 600k, by which point there is little left to do about
+# it but compact; the point of the line is to be seen while the session can
+# still be steered. Red is also where the turn table starts colouring WHOLE
+# rows (see the table's rank rule), so it is the threshold that decides when
+# the panel gets loud, not purple.
+CTX_YELLOW=30
+CTX_RED=50
+CTX_PURPLE=70
 # A value only gets colored once it clears an absolute floor — in a cheap
 # session (avg $0.05) a $0.13 turn is >2x average and would false-positive
 # red on money nobody would look twice at.
@@ -1695,7 +1701,7 @@ if shown:
         ctx_c, delta_c = ctx_pct_color(ctx_pct), delta_color(delta, avg_delta)
         # Whole-row coloring takes the worse of the two signals, with one
         # asymmetry: a delta spike colors the row at any band it reaches,
-        # context % only from RED up (CTX_RED, 60%) -- yellow stays a
+        # context % only from RED up (CTX_RED, 50%) -- yellow stays a
         # single-cell tint.
         #
         # This used to key on delta ALONE. The argument was that context %
@@ -1709,7 +1715,7 @@ if shown:
         # for the rest of a session is the intended behaviour, not the
         # failure mode; the session really is about to be compacted, and
         # that is worth one loud table rather than one quiet cell. Yellow
-        # is left alone because 40% of a window is routine and painting
+        # is left alone because 30% of a window is routine and painting
         # from there would put most sessions in permanent color, which is
         # the noise case the old comment was actually describing.
         ctx_rank = severity_rank(ctx_c)
