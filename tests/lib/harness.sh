@@ -130,6 +130,21 @@ sandbox_new() { # $1 = name
   printf '{}\n' > "$HOME/.claude/projects/test-project/seed.jsonl"
   age_corpus 3600
 
+  # The machine's process table is a fixture too, and for the same reason
+  # $HOME is. Two of the panel's pin decisions ask which processes are
+  # running -- which pane this panel is in (learn_pane_pairing's window walk)
+  # and whether a pinned session is still alive (session_is_live) -- and a
+  # check that let those reach the real `ps` would answer them from whatever
+  # the developer happens to have open: pairing a sandboxed panel to a real
+  # claude pane, and passing or failing by the hour of the day.
+  #
+  # Empty by default, so every check written before this seam existed still
+  # describes a machine with no processes on it, which is what it was written
+  # against. Checks that are about the process table fill it in with
+  # fake_ps_* below.
+  export PANEL_FAKE_PS="$SBX/ps.txt"
+  : > "$PANEL_FAKE_PS"
+
   # Empty-but-valid defaults for every query the panel makes. A check
   # overrides only the ones it is about; without these a missing fixture
   # makes the stub exit 70, and an empty report is indistinguishable from a
@@ -151,6 +166,37 @@ sandbox_new() { # $1 = name
   if [ -r "$HOME_REAL_BIN/claude-day-projection.sh" ]; then
     ln -sf "$HOME_REAL_BIN/claude-day-projection.sh" "$HOME/.local/bin/claude-day-projection.sh"
   fi
+}
+
+# ---- the fake process table ---------------------------------------------
+# Lines in the shape panel_ps() emits: "<pid> <ppid> <tty> <command...>".
+#
+# fake_ps_reset starts an empty machine; fake_ps_proc appends one process.
+# The pids are the check's own, so a check that needs the panel to find
+# ITSELF in the table (the window walk starts at $$) passes "$$".
+fake_ps_reset() { : > "$PANEL_FAKE_PS"; }
+fake_ps_proc() { # $1 pid, $2 ppid, $3 tty (or ??), $4.. command
+  local pid="$1" ppid="$2" tty="$3"; shift 3
+  printf '%s %s %s %s\n' "$pid" "$ppid" "$tty" "$*" >> "$PANEL_FAKE_PS"
+}
+
+# One Ghostty window as the launcher builds it: a window process under pid 1,
+# a claude pane, and a panel pane. Both panes walk up to the window, which is
+# the whole basis of window_claude_pane().
+fake_ps_window() { # $1 window pid, $2 claude tty, $3 claude session id (or -), $4 panel pid, $5 panel tty
+  local win="$1" ctty="$2" sid="$3" ppid="$4" ptty="$5"
+  fake_ps_proc "$win" 1 '??' "/Applications/Ghostty.app/Contents/MacOS/ghostty --window-save-state=never -e /Users/x/.local/bin/ghostty-claude-launcher /repo"
+  fake_ps_proc "$(( win + 1 ))" "$win" "$ctty" "/usr/bin/login -flp x /Users/x/.local/bin/ghostty-claude-launcher /repo"
+  fake_ps_proc "$(( win + 2 ))" "$(( win + 1 ))" "$ctty" "/bin/bash /Users/x/.local/bin/ghostty-claude-launcher /repo"
+  if [ "$sid" = "-" ]; then
+    fake_ps_proc "$(( win + 3 ))" "$(( win + 2 ))" "$ctty" "claude --dangerously-skip-permissions"
+  else
+    fake_ps_proc "$(( win + 3 ))" "$(( win + 2 ))" "$ctty" "claude --session-id $sid --dangerously-skip-permissions"
+    fake_ps_proc "$(( win + 4 ))" "$(( win + 3 ))" "$ctty" "caffeinate -i claude --session-id $sid --dangerously-skip-permissions"
+  fi
+  fake_ps_proc "$(( win + 5 ))" "$win" "$ptty" "/usr/bin/login -flp x /bin/bash --noprofile --norc -c exec -l /bin/zsh"
+  fake_ps_proc "$(( win + 6 ))" "$(( win + 5 ))" "$ptty" "-/bin/zsh"
+  fake_ps_proc "$ppid" "$(( win + 6 ))" "$ptty" "bash /Users/x/.local/bin/ccusage-panel.sh"
 }
 
 # Number of times the stub was invoked for a given ccusage subcommand,

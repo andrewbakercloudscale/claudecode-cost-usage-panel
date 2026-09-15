@@ -218,11 +218,27 @@ PANEL_TTY="${PANEL_PANE_TTY:-$(ps -o tty= -p $$ 2>/dev/null | tr -d '[:space:]')
 case "$PANEL_TTY" in ''|'??') PANEL_TTY="" ;; esac
 PIN_PANE_FILE=""
 [ -n "$PANEL_TTY" ] && PIN_PANE_FILE="$PIN_PANE_DIR/$PANEL_TTY"
-# Learned lazily by learn_pane_pairing(); empty until the launcher has
-# written the pairing, and empty forever for a panel started by hand or
-# through a path with no launcher, which keeps the directory-keyed fallback.
+# Learned lazily by learn_pane_pairing(), from the launcher's pairing file if
+# there is one and otherwise from this panel's own window (see
+# window_claude_pane).
+#
+# "Otherwise" used to mean "never", and that is how the 2026-09-15 blank
+# panels happened: the launcher can only write the pairing after it has
+# spotted the panel in a `pgrep`, and when that misses -- which it does, and
+# silently -- the panel spends its whole life on the directory-keyed pin,
+# which names a REPO and follows whichever session in that repo typed last.
+# Two of the three panels open in this repo that morning had no pairing file
+# at all.
 PANE_CLAUDE_TTY=""
 PIN_PANE_PIN_FILE=""
+# The session id off that claude's own command line, where the window walk
+# found one. Used ONLY when the pane is known and its tty pin is not there
+# yet -- a panel whose SessionStart hook has not run, or is not installed,
+# would otherwise be paired and permanently blind. Not authoritative: argv is
+# fixed at exec, so /clear and --resume hand the same process a new session id
+# while the command line keeps the old one. The tty pin, which the hook
+# rewrites on every one of those, always wins.
+PANE_CLAUDE_SID=""
 # A handoff written within this many seconds of the panel starting was
 # written FOR this launch, and is adopted unconditionally. An older one is
 # adopted only on positive evidence that the session it names is still live
@@ -255,6 +271,10 @@ PIN_RELEASED_SID=""
 # "<declined sid>><adopted sid>", so that steady state is recorded once
 # rather than on every refresh for the life of the pane.
 PIN_DECLINE_MEMO=""
+# ...and the same for "this pin's transcript is cold but its session is still
+# running", which is the steady state of an idle pane and would otherwise be
+# logged every ten seconds for as long as nobody types.
+PIN_LIVE_MEMO=""
 is_uuid() {
   case "$1" in
     [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
@@ -299,6 +319,39 @@ panel_date() {
 }
 
 PANEL_START_EPOCH=$(panel_now)
+
+# ---- the process table, in one shape, from one place --------------------
+# Two of the pin decisions below are really questions about processes: which
+# pane is this panel's (learn_pane_pairing), and whether the session a pin
+# names is still running (session_is_live). Both used to be answered
+# indirectly -- by a file the launcher raced to write, and by a transcript's
+# mtime -- and both indirect answers were wrong within the same week.
+#
+# One shape, "<pid> <ppid> <tty> <command...>", and one seam a check can
+# answer from a fixture, exactly as PANEL_FAKE_NOW does for the clock. The
+# test sandbox sets PANEL_FAKE_PS to an empty file, so a check reaches the
+# developer's real windows only if it says so.
+#
+# Cached for PANEL_PS_TTL seconds because one tick asks up to three times and
+# nothing can change between them; never cached from a fixture, because a
+# check that rewrites the fixture between ticks is describing a process that
+# started or stopped and has to be allowed to.
+PANEL_PS_TTL="${PANEL_PS_TTL:-5}"
+PANEL_PS_SNAPSHOT=""
+PANEL_PS_SNAPSHOT_AT=0
+panel_ps() {
+  local now
+  if [ -n "${PANEL_FAKE_PS:-}" ]; then
+    [ -r "$PANEL_FAKE_PS" ] && cat "$PANEL_FAKE_PS"
+    return 0
+  fi
+  now=$(panel_now)
+  if [ -z "$PANEL_PS_SNAPSHOT" ] || (( now - PANEL_PS_SNAPSHOT_AT >= PANEL_PS_TTL )); then
+    PANEL_PS_SNAPSHOT=$(ps -ax -o pid=,ppid=,tty=,command= 2>/dev/null)
+    PANEL_PS_SNAPSHOT_AT="$now"
+  fi
+  printf '%s\n' "$PANEL_PS_SNAPSHOT"
+}
 
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'
 # No dim/faint attribute anywhere in this panel: \033[2m renders as a
@@ -2015,23 +2068,158 @@ block_clock_tick() {
 # `pgrep`, several seconds after this panel started drawing, so the first few
 # ticks legitimately find nothing. Once learned it never changes.
 learn_pane_pairing() {
-  local ctty pid rest
+  local ctty pid rest sid
   [ -n "$PANE_CLAUDE_TTY" ] && return 0
-  [ -n "$PIN_PANE_FILE" ] && [ -r "$PIN_PANE_FILE" ] || return 0
-  IFS=$'\t' read -r ctty pid rest < "$PIN_PANE_FILE" 2>/dev/null || return 0
+  # The launcher's pairing file first, when there is one that was written for
+  # this process. The pid is what makes a tty safe to key on: terminal device
+  # names are recycled, so close this split and the next one opened in this
+  # window may be ttys004 again and inherit a pairing written for a different
+  # claude -- the same cross-pane misattribution this whole change exists to
+  # end, just displaced in time. `restart_if_changed` re-execs in place, which
+  # keeps the pid, so the one restart path this file has does not lose its
+  # pairing.
+  if [ -n "$PIN_PANE_FILE" ] && [ -r "$PIN_PANE_FILE" ]; then
+    IFS=$'\t' read -r ctty pid rest < "$PIN_PANE_FILE" 2>/dev/null || ctty=""
+    if [ -n "$ctty" ] && [ "$pid" = "$$" ]; then
+      PANE_CLAUDE_TTY="$ctty"
+      PIN_PANE_PIN_FILE="$PIN_TTY_DIR/$ctty"
+      pin_log "paired: panel tty ${PANEL_TTY:-none} -> claude tty $ctty (reading $PIN_PANE_PIN_FILE)"
+      return 0
+    fi
+  fi
+  # No pairing file, or one addressed to a process that is not this one.
+  # Either way it is not information, and the window can answer the same
+  # question without racing anything.
+  IFS=$'\t' read -r ctty sid < <(window_claude_pane) || return 0
   [ -n "$ctty" ] || return 0
-  # The pid is what makes a tty safe to key on. Terminal device names are
-  # recycled: close this split and the next one opened in this window may be
-  # ttys004 again and inherit a pairing written for a different claude —
-  # the same cross-pane misattribution this whole change exists to end, just
-  # displaced in time. Matching our own pid means a pairing can only ever be
-  # read by the process it was written for. `restart_if_changed` re-execs in
-  # place, which keeps the pid, so the one restart path this file has does
-  # not lose its pairing.
-  [ "$pid" = "$$" ] || return 0
   PANE_CLAUDE_TTY="$ctty"
+  PANE_CLAUDE_SID="$sid"
   PIN_PANE_PIN_FILE="$PIN_TTY_DIR/$ctty"
-  pin_log "paired: panel tty ${PANEL_TTY:-none} -> claude tty $ctty (reading $PIN_PANE_PIN_FILE)"
+  pin_log "paired by window: panel tty ${PANEL_TTY:-none} -> claude tty $ctty${sid:+ (argv session $sid)} (reading $PIN_PANE_PIN_FILE)"
+}
+
+# ---- which pane is this panel's, asked of the window it is in ----------
+# Prints "<claude tty>\t<session id from argv, or empty>" for the one claude
+# pane in this panel's own terminal window, and nothing at all when there are
+# none or more than one.
+#
+# The walk: every process in a Ghostty window descends from that window's own
+# `ghostty ... -e ghostty-claude-launcher <dir>` process -- this panel through
+# login -> zsh -> ccusage-panel.sh, and its claude through
+# login -> ghostty-claude-launcher -> claude. The window process is therefore
+# the one thing the two panes demonstrably share, and unlike the launcher's
+# pairing file it is a fact about the live process tree rather than a note
+# somebody managed to write down in time. Observed on 2026-09-15: panel 55120
+# and claude 54674 both walk up to ghostty 54665; panel 77229 and claude 77051
+# both walk up to ghostty 77030. The first two are the pane whose panel had
+# been blind since 10:29.
+#
+# A claude with no controlling terminal is in no pane -- `--print` review
+# sections, hook one-shots, anything a build shells out to -- and is skipped
+# here for the same reason the SessionStart hook writes it no pin at all.
+#
+# Two claude panes in one window is ambiguity, and this prints nothing rather
+# than pick: the rule the rest of this file is built on is that an honest
+# blank beats a confident wrong answer.
+#
+# Under tmux none of this holds. Every pane descends from the one tmux SERVER,
+# shared by every window and every session on the machine, so the walk would
+# answer "all of them"; it declines there and the launcher's pairing file (and
+# `split-window`, which does not race) stays the channel.
+window_claude_pane() {
+  [ -n "${TMUX:-}" ] && return 1
+  panel_ps | awk -v me="$$" '
+    # The outermost ancestor below pid 1 -- the terminal-emulator process for
+    # one window. Iteration-capped because a walk over a table read at two
+    # different instants can, in principle, close a cycle.
+    function windowof(p,   n, up) {
+      n = 0
+      while ((p in P) && n++ < 64) {
+        up = P[p]
+        if (up + 0 <= 1) return p
+        p = up
+      }
+      return ""
+    }
+    {
+      cmd = ""
+      for (i = 4; i <= NF; i++) cmd = cmd (i > 4 ? " " : "") $i
+      P[$1] = $2; T[$1] = $3; C[$1] = cmd
+    }
+    END {
+      win = windowof(me)
+      if (win == "") exit 1
+      for (p in C) {
+        if (T[p] == "??" || T[p] == "") continue
+        # `claude` as its own argv word: a path ending in it, or the bare
+        # name. Not `ghostty-claude-launcher`, which is in every one of these
+        # windows and is not a session.
+        if (C[p] !~ /(^|\/| )claude( |$)/) continue
+        if (windowof(p) != win) continue
+        sid = ""
+        if (match(C[p], /--session-id[ =][0-9a-f-]+/))
+          sid = substr(C[p], RSTART + 13, RLENGTH - 13)
+        # `caffeinate -i claude --session-id X` is the same pane as the claude
+        # it wraps, so key on the tty and keep whichever copy names the id.
+        if (!(T[p] in seen) || sid != "") seen[T[p]] = sid
+      }
+      n = 0
+      for (t in seen) { n++; one_t = t; one_s = seen[t] }
+      if (n != 1) exit 1
+      printf "%s\t%s\n", one_t, one_s
+    }'
+}
+
+# ---- is the session a pin names still running? -------------------------
+# Not "is its transcript being written to", which is the question
+# PIN_DEAD_SECS asks and a different question with a different answer. An
+# interactive session nobody has typed into for half an hour has a cold
+# transcript and a perfectly live `claude`; a review section that finished
+# has a cold transcript and no process at all. Only the second one is over.
+#
+# Two ways to be alive, either sufficient:
+#
+#   * the id is on a live process's own command line. The launcher always
+#     passes `--session-id`, so this is the usual answer, and it is exact.
+#   * a tty pin names it and that pane still has a claude in it. This is what
+#     covers the session ids argv cannot know: a /clear or a --resume gives
+#     the same process a new id, and only the hook and the pin see it.
+#
+# Absence of both is the evidence for release. It is not proof -- a claude
+# started by hand, with no --session-id and no hook, is alive and invisible
+# here -- which is why this only ever GUARDS a release that the transcript
+# has already been cold for half an hour to earn.
+session_is_live() { # $1 = session id
+  local sid="$1" f pinned
+  [ -n "$sid" ] || return 1
+  is_uuid "$sid" || return 1
+  if panel_ps | awk -v sid="$sid" '
+       index($0, "--session-id " sid) || index($0, "--session-id=" sid) { found = 1 }
+       END { exit !found }'; then
+    return 0
+  fi
+  for f in "$PIN_TTY_DIR"/*; do
+    [ -f "$f" ] || continue
+    IFS=$'\t' read -r pinned _ < "$f" 2>/dev/null || continue
+    [ "$pinned" = "$sid" ] || continue
+    tty_has_claude "${f##*/}" && return 0
+  done
+  return 1
+}
+
+# Is there a live claude in this terminal? The tty is the pane, so this is
+# "is that pane still running a session", and the tty pin is what says which.
+tty_has_claude() { # $1 = tty name, as `ps -o tty=` prints it
+  local t="$1"
+  [ -n "$t" ] || return 1
+  case "$t" in ''|'??') return 1 ;; esac
+  panel_ps | awk -v want="$t" '
+    {
+      cmd = ""
+      for (i = 4; i <= NF; i++) cmd = cmd (i > 4 ? " " : "") $i
+      if ($3 == want && cmd ~ /(^|\/| )claude( |$)/) found = 1
+    }
+    END { exit !found }'
 }
 
 # ---- stop believing a pin whose session is over ----
@@ -2055,14 +2243,35 @@ release_dead_pin() {
   [ -f "$tsc" ] || return 0
   age=$(( $(panel_now) - $(stat -f %m "$tsc" 2>/dev/null || stat -c %Y "$tsc" 2>/dev/null || echo 0) ))
   (( age > PIN_DEAD_SECS )) || return 0
-  pin_log "releasing $PIN_SOURCE pin '$PIN_SESSION_ID': its transcript has not been written to for ${age}s (limit ${PIN_DEAD_SECS}s)"
+  # Cold is not over. A transcript stops growing the moment its session stops
+  # being typed into, so this timer fires on an idle pane exactly as it fires
+  # on a finished one, and half an hour of reading is an ordinary way to spend
+  # a morning. On 2026-09-15 the two unpaired panels in this repo dropped a
+  # live session at 10:29:13 for having been quiet since 09:59, went blank
+  # through "no active Claude Code session found" for eighteen minutes, and
+  # then adopted a session from a DIFFERENT pane -- the misattribution this
+  # release was added to prevent, caused by the release itself. `claude` pid
+  # 54674 was running the whole time and is still running now.
+  #
+  # So ask the process table before dropping anything. A pin whose claude is
+  # alive is kept, and the release is left for the case it was written for: a
+  # session that has ended.
+  if session_is_live "$PIN_SESSION_ID"; then
+    if [ "$PIN_LIVE_MEMO" != "$PIN_SESSION_ID" ]; then
+      PIN_LIVE_MEMO="$PIN_SESSION_ID"
+      pin_log "keeping $PIN_SOURCE pin '$PIN_SESSION_ID': its transcript has been quiet for ${age}s (limit ${PIN_DEAD_SECS}s) but its session is still running"
+    fi
+    return 0
+  fi
+  PIN_LIVE_MEMO=""
+  pin_log "releasing $PIN_SOURCE pin '$PIN_SESSION_ID': its transcript has not been written to for ${age}s (limit ${PIN_DEAD_SECS}s) and no process is running it"
   PIN_RELEASED_SID="$PIN_SESSION_ID"
   PIN_SESSION_ID=""
   PIN_SOURCE=""
 }
 
 adopt_handoff_pin() {
-  local sid written age tsc now lone
+  local sid written written_raw age tsc now lone
   # An argv pin is the caller being explicit; do not second-guess it until
   # resolve_session has given up on it and cleared PIN_SOURCE.
   [ "$PIN_SOURCE" = "argv" ] && return 0
@@ -2087,7 +2296,22 @@ adopt_handoff_pin() {
   # SessionStart hook) or has gone. Hold what we have rather than fall back
   # to the directory file: we know for a fact that file is not addressed to
   # this pane.
-  [ -n "$PANE_CLAUDE_TTY" ] && return 0
+  #
+  # Unless the window walk read an id off that claude's command line, which
+  # is the one case where the pane is known and the hook is not involved at
+  # all. Without this a panel on a machine whose SessionStart hook is missing
+  # or not yet installed would be paired and permanently blind -- better
+  # addressed than the directory pin, and worse off than it.
+  if [ -n "$PANE_CLAUDE_TTY" ]; then
+    if [ -n "$PANE_CLAUDE_SID" ] && [ "$PANE_CLAUDE_SID" != "$PIN_SESSION_ID" ] \
+       && is_uuid "$PANE_CLAUDE_SID"; then
+      pin_log "adopting argv session '$PANE_CLAUDE_SID' from the claude in tty $PANE_CLAUDE_TTY (no pin at $PIN_PANE_PIN_FILE)"
+      PIN_SESSION_ID="$PANE_CLAUDE_SID"
+      PIN_SOURCE="pane"
+      PIN_RELEASED_SID=""
+    fi
+    return 0
+  fi
   [ -r "$PIN_HANDOFF_FILE" ] || return 0
   IFS=$'\t' read -r sid written < "$PIN_HANDOFF_FILE" 2>/dev/null || return 0
   is_uuid "${sid:-}" || return 0
@@ -2100,6 +2324,7 @@ adopt_handoff_pin() {
   # instead, where it has to prove its transcript is being written to again:
   # the same test that released it, so a genuinely resumed session comes
   # back and a finished one does not.
+  written_raw="$written"
   if [ "$sid" = "$PIN_RELEASED_SID" ]; then
     written=0
   fi
@@ -2140,7 +2365,12 @@ adopt_handoff_pin() {
       fi
       return 0
     fi
-    pin_log "adopting unaligned handoff pin '$sid' (written $(( now - written ))s ago, panel started $(( now - PANEL_START_EPOCH ))s ago, transcript touched ${age}s ago)"
+    # written_raw, not written: the flap guard above zeroes `written` to force
+    # this path, and "written 1789455546s ago" -- fifty-six years, the whole
+    # epoch -- is what that printed instead. A log line that reads as
+    # corruption when nothing is corrupt costs an hour every time it is
+    # believed.
+    pin_log "adopting unaligned handoff pin '$sid' (written $(( now - written_raw ))s ago, panel started $(( now - PANEL_START_EPOCH ))s ago, transcript touched ${age}s ago)"
   else
     pin_log "adopting handoff pin '$sid' for $PWD"
   fi
@@ -2187,7 +2417,15 @@ lone_live_pane_session() {
     tsc="$project_dir/$sid.jsonl"
     [ -f "$tsc" ] || continue
     age=$(( now - $(stat -f %m "$tsc" 2>/dev/null || stat -c %Y "$tsc" 2>/dev/null || echo 0) ))
-    (( age >= 0 && age <= PIN_HANDOFF_LIVE_SECS )) || continue
+    # Written to recently, OR still running. The mtime half alone made this
+    # recovery useless in the case that needs it most: the panel that has
+    # just dropped a pin because nobody has typed for half an hour then finds
+    # no candidate either, for the same reason, and stays blank until the
+    # person it is reporting on comes back. A session with a live process is
+    # a live pane session whether or not it is mid-turn.
+    if (( age < 0 || age > PIN_HANDOFF_LIVE_SECS )); then
+      session_is_live "$sid" || continue
+    fi
     # A second candidate is ambiguity, not a better answer.
     [ -n "$found" ] && return 0
     found="$sid"
