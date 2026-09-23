@@ -1184,10 +1184,150 @@ recent_sections_fetch() {
   #
   # Renamed here, in the one adapter, so every consumer downstream keeps
   # reading `.period` and none of them has to know which report it came from.
-  jq -c -n --argjson d "${d:-null}" --argjson w "${w:-null}" --argjson m "${m:-null}" \
+  local merged
+  merged=$(jq -c -n --argjson d "${d:-null}" --argjson w "${w:-null}" --argjson m "${m:-null}" \
     '{ daily:   [ ($d.daily   // [])[] | .period = .date  ],
        weekly:  [ ($w.weekly  // [])[] | .period = .week  ],
-       monthly: [ ($m.monthly // [])[] | .period = .month ] }' 2>/dev/null
+       monthly: [ ($m.monthly // [])[] | .period = .month ] }' 2>/dev/null)
+  backfill_unpriced "$merged"
+}
+
+# Fills in what ccusage priced at $0 (see unpriced_models) from the panel's
+# own price table, when the panel has a rate for that model.
+#
+# ccusage ships its prices with the release, and on 2026-09-23 neither the
+# installed nor the latest ccusage knew Claude Opus 5.5 -- a day of Opus 5.5
+# rendered as `opus-5-5: $0`, then as `?`. Pricing it from ccusage's own
+# token totals is not an option: its breakdown does not split 5m from 1h
+# cache writes (2x vs 1.25x input), and that day's Opus 5.5 writes were 97%
+# 1h, so the aggregate would have come out low. This re-reads the
+# transcripts for just those models, prices each message exactly as the turn
+# table does, and writes the result into the daily, weekly and monthly rows.
+#
+# Only a breakdown ccusage left at $0 is touched; a model ccusage does price
+# keeps ccusage's figure. A model neither of us can price stays at $0 and
+# unpriced_models still flags it.
+backfill_unpriced() {
+  local json="$1" want since extra
+  want=$(unpriced_models "$json" | tr '\n' ' ')
+  since=$(jq -r '[.daily[]? | select(any(.modelBreakdowns[]?;
+            (.cost // 0) == 0 and ((.inputTokens // 0) + (.outputTokens // 0)
+              + (.cacheCreationTokens // 0) + (.cacheReadTokens // 0)) > 0))
+          | .period] | min // empty' <<<"$json" 2>/dev/null)
+  if [ -z "${want// /}" ] || [ -z "$since" ]; then
+    printf '%s' "$json"
+    return
+  fi
+  extra=$(python3 - "$since" $want <<'BACKFILL_PYEOF'
+import glob, json, os, sys, datetime as dt
+
+PRICES = {
+    "claude-sonnet-5":   (2.00, 10.00),
+    "claude-opus-5-5":   (4.00, 20.00),
+    "claude-opus-5":     (5.00, 25.00),
+    "claude-haiku-4-5":  (1.00, 5.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-8":   (5.00, 25.00),
+    "claude-opus-4-7":   (5.00, 25.00),
+    "claude-opus-4-6":   (5.00, 25.00),
+    "claude-fable-5":    (10.00, 50.00),
+    "claude-fable-5-1":  (10.00, 50.00),
+    "claude-mythos-5":   (10.00, 50.00),
+    "claude-mythos-5-1": (10.00, 50.00),
+}
+CACHE_READ_PRICE = {
+    "claude-opus-5-5":   0.20,
+    "claude-fable-5-1":  0.25,
+}
+CACHE_READ_MULT, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT = 0.1, 1.25, 2.0
+
+since = dt.date.fromisoformat(sys.argv[1])
+want = {m for m in sys.argv[2:] if m in PRICES}
+out = {}
+if want:
+    # Append-only files: an mtime before `since` cannot hold a later entry.
+    cutoff = dt.datetime.combine(since, dt.time()).timestamp() - 86400
+    seen = set()
+    for path in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                continue
+            with open(path) as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            if '"assistant"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            msg = d.get("message") or {}
+            model = msg.get("model")
+            usage = msg.get("usage")
+            if model not in want or not usage or d.get("type") != "assistant":
+                continue
+            # Same dedup key as ccusage: a message is logged once per content
+            # block, each carrying the same usage.
+            key = (msg.get("id"), d.get("requestId"))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                day = dt.datetime.fromisoformat(
+                    d["timestamp"].replace("Z", "+00:00")).astimezone().date()
+            except (KeyError, ValueError):
+                continue
+            if day < since:
+                continue
+            cc = usage.get("cache_creation") or {}
+            if cc:
+                cw_1h = cc.get("ephemeral_1h_input_tokens", 0)
+                cw_5m = cc.get("ephemeral_5m_input_tokens", 0)
+            else:
+                cw_1h, cw_5m = 0, usage.get("cache_creation_input_tokens", 0)
+            price_in, price_out = PRICES[model]
+            price_cr = CACHE_READ_PRICE.get(model, price_in * CACHE_READ_MULT)
+            cost = (
+                usage.get("input_tokens", 0) * price_in
+                + usage.get("output_tokens", 0) * price_out
+                + usage.get("cache_read_input_tokens", 0) * price_cr
+                + cw_1h * price_in * CACHE_WRITE_1H_MULT
+                + cw_5m * price_in * CACHE_WRITE_5M_MULT
+            ) / 1_000_000
+            per = out.setdefault(day.isoformat(), {})
+            per[model] = per.get(model, 0.0) + cost
+print(json.dumps(out))
+BACKFILL_PYEOF
+  )
+  if [ -z "$extra" ] || [ "$extra" = "{}" ]; then
+    printf '%s' "$json"
+    return
+  fi
+  # A row's span: a day is its own date, a week the seven days from its
+  # start (whichever weekday ccusage starts on -- see check Z), a month
+  # every date with its YYYY-MM prefix.
+  jq -c --argjson x "$extra" '
+    def day_add($n): (. + "T00:00:00Z" | fromdate) + $n * 86400 | todate[0:10];
+    def in_span($kind; $p):
+      if   $kind == "day"  then . == $p
+      elif $kind == "week" then . >= $p and . <= ($p | day_add(6))
+      else startswith($p) end;
+    def fill($kind):
+      .period as $p
+      | [ $x | to_entries[] | select(.key | in_span($kind; $p)) | .value ] as $days
+      | ((.modelBreakdowns // []) | map(.cost // 0) | add // 0) as $before
+      | .modelBreakdowns = [ (.modelBreakdowns // [])[]
+          | if (.cost // 0) == 0
+            then .modelName as $m | .cost = ([ $days[] | .[$m] // 0 ] | add // 0)
+            else . end ]
+      | .totalCost = (.totalCost // 0)
+          + (([ .modelBreakdowns[].cost ] | add // 0) - $before);
+    .daily   |= map(fill("day"))
+    | .weekly  |= map(fill("week"))
+    | .monthly |= map(fill("month"))
+  ' <<<"$json" 2>/dev/null || printf '%s' "$json"
 }
 # Fetched once per slow tick by the loop and read from here, so the three
 # cache reads and the merge above happen once rather than once per caller.
