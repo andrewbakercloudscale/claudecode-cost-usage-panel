@@ -3708,8 +3708,8 @@ cat > "$BIN_DIR/claude-panel-session-hook.sh" <<'SESSHOOK_EOF'
 # therefore unpinned, every time, and left the panel guessing. Here the
 # session has already started and simply reports what it is.
 #
-# Must print nothing: SessionStart hook stdout is injected into the model's
-# context.
+# Prints only the sessionTitle JSON below: plain SessionStart hook stdout is
+# injected into the model's context.
 set -uo pipefail
 
 PIN_DIR="${PANEL_PIN_DIR:-$HOME/.cache/claude-panel-pin}"
@@ -3721,6 +3721,22 @@ payload=$(cat 2>/dev/null)
 sid=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)
 cwd=$(printf '%s' "$payload" | jq -r '.cwd // empty' 2>/dev/null)
 [ -n "$sid" ] && [ -n "$cwd" ] || exit 0
+
+# Name the session after its folder, which is what the terminal title shows.
+# Without a session title Claude Code titles every window "Claude Code", so
+# five of them are indistinguishable in the window switcher. SessionStart's
+# hookSpecificOutput.sessionTitle is the supported way to set one (the same
+# thing /rename does), and it is the ONLY thing this hook prints: JSON stdout
+# is parsed as hook output, not injected into the model's context.
+#
+# "startup" only. A resumed session may carry a title someone chose with
+# /rename, and clobbering it with the folder name would undo that choice.
+# PANEL_SESSION_TITLE=0 turns it off.
+source=$(printf '%s' "$payload" | jq -r '.source // empty' 2>/dev/null)
+if [ "$source" = "startup" ] && [ "${PANEL_SESSION_TITLE:-1}" != "0" ]; then
+  jq -cn --arg t "${cwd##*/}" \
+    '{hookSpecificOutput: {hookEventName: "SessionStart", sessionTitle: $t}}' 2>/dev/null
+fi
 
 case "$sid" in
   [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
