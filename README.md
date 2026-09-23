@@ -118,6 +118,15 @@ You can also run the panel manually at any time, in any terminal:
 ~/.local/bin/ccusage-panel.sh [refresh_seconds] [turn_rows]
 ```
 
+### Options
+
+`~/.config/claude-panel/options` — created by the installer with everything `false`, never overwritten. Read at launch time, so an edit applies to the next session/panel without re-deploying. An environment variable of the same name overrides the file.
+
+| Option | Effect when `true` |
+|---|---|
+| `CLAUDE_PANEL_REMOTE_CONTROL` | Interactive `claude` launches (the `~/.zshrc` wrapper and `ghostty-claude-launcher`) start with `--remote-control`. Skipped for subcommands, a positional prompt, `-p`, `--help`/`--version`, or when you pass `--remote-control` yourself. |
+| `CLAUDE_PANEL_CAFFEINATE` | Each panel runs `caffeinate -i -w <panel pid>`, keeping the Mac awake while the panel is open. |
+
 ### Refresh tiers
 
 The panel redraws on two clocks, and **each section header states its

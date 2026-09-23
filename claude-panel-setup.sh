@@ -3367,12 +3367,41 @@ last_cols=0
 summary_block=""
 trailing_raw=""
 
+# Install-time options, one KEY=value per line in
+# ~/.config/claude-panel/options (written with every option false by
+# claude-panel-setup.sh; an environment variable of the same name wins).
+# Read with grep, not sourced, so the file can only ever set a flag.
+# True is true/1/yes/on; anything else, or no file, is false.
+panel_option() { # $1 = KEY
+  local v="${!1:-}"
+  if [ -z "$v" ]; then
+    v=$(grep -E "^$1=" "$HOME/.config/claude-panel/options" 2>/dev/null | tail -1)
+    v="${v#*=}"
+  fi
+  case "$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]' | tr -d '"'"'"' ')" in
+    true|1|yes|on) return 0 ;;
+  esac
+  return 1
+}
+
 # Test seam: source this file with PANEL_LIB_ONLY=1 to get every function
 # above without entering the render loop. The tty setup further up is
 # already guarded by `[ -t 0 ]`, so a sourced panel touches no terminal and
 # installs no traps.
 if [ -n "${PANEL_LIB_ONLY:-}" ]; then
   return 0 2>/dev/null || exit 0
+fi
+
+# CLAUDE_PANEL_CAFFEINATE (options file, see panel_option): keep the Mac
+# awake for as long as this panel runs. `caffeinate -w` watches our pid
+# rather than wrapping our command line, so the panel's argv -- which the
+# launcher's pgrep and the pane walk both match on -- is unchanged. The
+# exported marker stops restart_if_changed's exec (same pid) from starting
+# a second one.
+if panel_option CLAUDE_PANEL_CAFFEINATE && [ "${CLAUDE_PANEL_CAFFEINATED:-}" != "$$" ] \
+   && command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -i -w "$$" >/dev/null 2>&1 &
+  export CLAUDE_PANEL_CAFFEINATED="$$"
 fi
 
 last_frame=""
@@ -4380,14 +4409,27 @@ exit 0
 LAUNCH_EOF
 chmod +x "$BIN_DIR/claude-panel-launch.sh"
 
+# Install-time options, read at run time by the panel (CLAUDE_PANEL_CAFFEINATE)
+# and by the `claude` wrapper / Finder launcher (CLAUDE_PANEL_REMOTE_CONTROL).
+# Created with everything off; an existing file is never overwritten, and a
+# key missing from it is appended as false so the file lists every option.
+PANEL_OPTIONS="$HOME/.config/claude-panel/options"
+mkdir -p "$(dirname "$PANEL_OPTIONS")"
+[ -f "$PANEL_OPTIONS" ] || printf '%s\n' \
+  "# claude-panel options -- true/false. Written by claude-panel-setup.sh." \
+  "# CLAUDE_PANEL_REMOTE_CONTROL: start interactive claude sessions with --remote-control" \
+  "# CLAUDE_PANEL_CAFFEINATE: keep the Mac awake (caffeinate -i) while a panel runs" \
+  > "$PANEL_OPTIONS"
+for opt in CLAUDE_PANEL_REMOTE_CONTROL CLAUDE_PANEL_CAFFEINATE; do
+  grep -qE "^$opt=" "$PANEL_OPTIONS" || printf '%s=false\n' "$opt" >> "$PANEL_OPTIONS"
+done
+echo "Options: $PANEL_OPTIONS ($(grep -E '^CLAUDE_PANEL_' "$PANEL_OPTIONS" | tr '\n' ' '))"
+
 ZSHRC="$HOME/.zshrc"
 MARKER="# --- ccusage split-panel autolaunch"
-if [ -f "$ZSHRC" ] && grep -qF "$MARKER" "$ZSHRC"; then
-  echo "~/.zshrc already has the autolaunch hook — leaving it as-is."
-else
-  echo "Adding the autolaunch hook to ~/.zshrc ..."
-  cat >> "$ZSHRC" <<'ZSHRC_EOF'
-
+END_MARKER="# --- end ccusage split-panel autolaunch ---"
+ZSHRC_BLOCK=$(mktemp "${TMPDIR:-/tmp}/zshrc-block.XXXXXX")
+cat > "$ZSHRC_BLOCK" <<'ZSHRC_EOF'
 # --- ccusage split-panel autolaunch (installed by claude-panel-setup.sh) ---
 # Fires once per terminal window, the first time a `claude*` command runs:
 # opens a right-hand Ghostty split running the live usage panel, then
@@ -4427,12 +4469,34 @@ if [ -z "${_CCUSAGE_CLAUDE_WRAPPED:-}" ]; then
   (( $+functions[claude] )) && functions -c claude _ccusage_claude_orig
   _CCUSAGE_CLAUDE_WRAPPED=1
 fi
+# CLAUDE_PANEL_REMOTE_CONTROL (~/.config/claude-panel/options) adds
+# --remote-control to interactive launches only: the first argument must be
+# empty or a flag, so a subcommand (`claude mcp ...`) or a positional prompt
+# is left alone, and it is never added to -p/--help/--version or on top of
+# the user's own --remote-control. It goes directly before the user's
+# arguments, so the token after it is always a flag and never read as the
+# optional session name.
+_ccusage_want_rc() {
+  local v
+  v=$(grep -E '^CLAUDE_PANEL_REMOTE_CONTROL=' ~/.config/claude-panel/options 2>/dev/null | tail -1)
+  v="${CLAUDE_PANEL_REMOTE_CONTROL:-${v#*=}}"
+  case "${(L)v//[\"\' ]/}" in true|1|yes|on) ;; *) return 1 ;; esac
+  case "${1:-}" in ''|-*) ;; *) return 1 ;; esac
+  local a
+  for a in "$@"; do
+    case "$a" in
+      -p|--print|-h|--help|-v|--version|--remote-control|--remote-control=*) return 1 ;;
+    esac
+  done
+  return 0
+}
 claude() {
   local -a args
   if [ -n "${CLAUDE_PANEL_PIN_SID:-}" ]; then
     args=(--session-id "$CLAUDE_PANEL_PIN_SID")
     unset CLAUDE_PANEL_PIN_SID
   fi
+  _ccusage_want_rc "$@" && args+=(--remote-control)
   if (( $+functions[_ccusage_claude_orig] )); then
     _ccusage_claude_orig "${args[@]}" "$@"
   else
@@ -4464,7 +4528,38 @@ autoload -Uz add-zsh-hook
 add-zsh-hook preexec _ccusage_panel_autolaunch
 # --- end ccusage split-panel autolaunch ---
 ZSHRC_EOF
+# Replaced in place on every install rather than written once, so a change
+# to the block reaches machines that already have it (it used to say
+# "leaving it as-is", which meant an edit here never shipped). Only between
+# both markers; with the end marker missing the block has been hand-edited
+# and is left alone rather than guessed at.
+if [ -f "$ZSHRC" ] && grep -qF "$MARKER" "$ZSHRC"; then
+  if grep -qxF "$END_MARKER" "$ZSHRC"; then
+    zshrc_new=$(mktemp "${TMPDIR:-/tmp}/zshrc.XXXXXX")
+    awk -v start="$MARKER" -v end="$END_MARKER" -v block="$ZSHRC_BLOCK" '
+      !skip && index($0, start) == 1 {
+        while ((getline l < block) > 0) print l
+        skip = 1; next
+      }
+      skip && $0 == end { skip = 0; next }
+      !skip
+    ' "$ZSHRC" > "$zshrc_new"
+    if cmp -s "$zshrc_new" "$ZSHRC"; then
+      echo "~/.zshrc autolaunch hook is current."
+    else
+      cp "$ZSHRC" "$ZSHRC.bak-ccusage-$(date +%Y%m%d-%H%M%S)"
+      cat "$zshrc_new" > "$ZSHRC"
+      echo "Updated the autolaunch hook in ~/.zshrc (backup alongside it)."
+    fi
+    rm -f "$zshrc_new"
+  else
+    echo "~/.zshrc has the autolaunch hook but no end marker — hand-edited, leaving it as-is." >&2
+  fi
+else
+  echo "Adding the autolaunch hook to ~/.zshrc ..."
+  { printf '\n'; cat "$ZSHRC_BLOCK"; } >> "$ZSHRC"
 fi
+rm -f "$ZSHRC_BLOCK"
 
 # If a `ghostty-claude-launcher` script exists (e.g. a Finder Service /
 # Automator workflow that runs `open -na Ghostty.app --args -e
@@ -4528,6 +4623,41 @@ GCL_EOF
   chmod +x "$GCL"
 else
   echo "No ~/.local/bin/ghostty-claude-launcher found — skipping (not using that Finder Service workflow)."
+fi
+
+# CLAUDE_PANEL_REMOTE_CONTROL for the Finder launch path, which execs claude
+# without the ~/.zshrc wrapper. A separate step from the patch above so that
+# launchers patched before this option existed pick it up too: it reads the
+# options file at launch time and adds --remote-control straight after the
+# pinned --session-id, where the next token is the launcher's own flag.
+GCL_RC_MARKER="# CLAUDE_PANEL_REMOTE_CONTROL (claude-panel options)"
+GCL_PIN_LINE='"$CLAUDE" --session-id "$PIN_SID"'
+if [ -f "$GCL" ] && grep -qF "$GCL_PIN_LINE" "$GCL" && ! grep -qF "$GCL_RC_MARKER" "$GCL"; then
+  echo "Adding the Remote Control option to ~/.local/bin/ghostty-claude-launcher ..."
+  rc_snip=$(mktemp)
+  cat > "$rc_snip" <<'GCL_RC_EOF'
+# CLAUDE_PANEL_REMOTE_CONTROL (claude-panel options)
+PANEL_RC_ARGS=()
+rc_opt="$(grep -E '^CLAUDE_PANEL_REMOTE_CONTROL=' "$HOME/.config/claude-panel/options" 2>/dev/null | tail -1)"
+rc_opt="$(printf '%s' "${rc_opt#*=}" | tr -d "\"' " | tr '[:upper:]' '[:lower:]')"
+case "$rc_opt" in true|1|yes|on) PANEL_RC_ARGS=(--remote-control) ;; esac
+GCL_RC_EOF
+  # Above the comment that sits on the launch line, if there is one, so the
+  # comment stays attached to the line it describes.
+  pin_n=$(grep -nF "$GCL_PIN_LINE" "$GCL" | head -1 | cut -d: -f1)
+  at_n=$pin_n
+  case "$(sed -n "$((pin_n - 1))p" "$GCL" | sed 's/^[[:space:]]*//')" in '#'*) at_n=$((pin_n - 1)) ;; esac
+  tmp=$(mktemp)
+  awk -v at="$at_n" -v pin_n="$pin_n" -v snip="$rc_snip" '
+    NR == at { while ((getline l < snip) > 0) print l }
+    NR == pin_n {
+      sub(/"\$CLAUDE" --session-id "\$PIN_SID"/, "\"$CLAUDE\" --session-id \"$PIN_SID\" \"${PANEL_RC_ARGS[@]}\"")
+    }
+    { print }
+  ' "$GCL" > "$tmp"
+  rm -f "$rc_snip"
+  mv "$tmp" "$GCL"
+  chmod +x "$GCL"
 fi
 
 # The launcher shrinks the new split to ~1/3 width via repeated
