@@ -80,4 +80,18 @@ check_I_unknown_model() {
   assert_eq "the summary builds with no stderr at all" "" "$(cat "$err")"
   assert_contains "the summary shows N/A for context" "Context Usage: N/A" "$summary"
   assert_not_contains "and never a percentage against an unknown window" "(0%)" "$summary"
+
+  # An API error, logged by Claude Code as a zero-usage reply from model
+  # "<synthetic>", is not a turn: it must not be flagged unpriced, which
+  # blanked Session and Burn for the rest of the session over one network
+  # blip, and must not become the Model line's model.
+  printf '%s\n%s\n' \
+    '{"type":"assistant","timestamp":"2026-09-01T10:00:00.000Z","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}' \
+    '{"type":"assistant","timestamp":"2026-09-01T10:01:00.000Z","message":{"id":"m9","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}' > "$tp"
+  latest="$tp"
+  session_stats_refresh
+  assert_not_contains "a <synthetic> API-error line is not an unpriced turn" "no known price" "$SESS_TABLE"
+  assert_eq "and does not blank the session cost" "5.000000" "$SESS_COST"
+  assert_eq "nor become the session's model" "claude-opus-5" \
+    "$(session_identity_cached "$tp" | cut -f2)"
 }

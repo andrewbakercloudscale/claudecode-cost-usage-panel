@@ -1243,12 +1243,19 @@ CACHE_READ_MULT, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT = 0.1, 1.25, 2.0
 
 since = dt.date.fromisoformat(sys.argv[1])
 want = {m for m in sys.argv[2:] if m in PRICES}
-out = {}
+# The same priced messages, summed three ways: by local day (the daily,
+# weekly and monthly rows), by session (the session report behind Top
+# Sessions, Folder and the per-session baselines) and by UTC hour (the
+# active block, whose start and end are both on the hour).
+out = {"day": {}, "session": {}, "hour": {}}
 if want:
     # Append-only files: an mtime before `since` cannot hold a later entry.
     cutoff = dt.datetime.combine(since, dt.time()).timestamp() - 86400
     seen = set()
-    for path in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+    # Recursive: subagent transcripts live under <project>/<sid>/subagents/,
+    # and ccusage counts them. A top-level-only glob missed ~1% of a day.
+    for path in glob.glob(os.path.expanduser("~/.claude/projects/**/*.jsonl"),
+                          recursive=True):
         try:
             if os.path.getmtime(path) < cutoff:
                 continue
@@ -1275,10 +1282,12 @@ if want:
                 continue
             seen.add(key)
             try:
-                day = dt.datetime.fromisoformat(
-                    d["timestamp"].replace("Z", "+00:00")).astimezone().date()
+                when = dt.datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00"))
             except (KeyError, ValueError):
                 continue
+            day = when.astimezone().date()
+            sid = d.get("sessionId") or os.path.basename(path).removesuffix(".jsonl")
+            hour = str(int(when.timestamp()) // 3600 * 3600)
             if day < since:
                 continue
             cc = usage.get("cache_creation") or {}
@@ -1296,12 +1305,13 @@ if want:
                 + cw_1h * price_in * CACHE_WRITE_1H_MULT
                 + cw_5m * price_in * CACHE_WRITE_5M_MULT
             ) / 1_000_000
-            per = out.setdefault(day.isoformat(), {})
-            per[model] = per.get(model, 0.0) + cost
+            for kind, k in (("day", day.isoformat()), ("session", sid), ("hour", hour)):
+                per = out[kind].setdefault(k, {})
+                per[model] = per.get(model, 0.0) + cost
 print(json.dumps(out))
 BACKFILL_PYEOF
   )
-  if [ -z "$extra" ] || [ "$extra" = "{}" ]; then
+  if [ -z "$extra" ] || [ "$(jq -r '.day | length' <<<"$extra" 2>/dev/null)" = "0" ]; then
     printf '%s' "$json"
     return
   fi
@@ -1316,7 +1326,7 @@ BACKFILL_PYEOF
       else startswith($p) end;
     def fill($kind):
       .period as $p
-      | [ $x | to_entries[] | select(.key | in_span($kind; $p)) | .value ] as $days
+      | [ $x.day | to_entries[] | select(.key | in_span($kind; $p)) | .value ] as $days
       | ((.modelBreakdowns // []) | map(.cost // 0) | add // 0) as $before
       | .modelBreakdowns = [ (.modelBreakdowns // [])[]
           | if (.cost // 0) == 0
@@ -1327,7 +1337,48 @@ BACKFILL_PYEOF
     .daily   |= map(fill("day"))
     | .weekly  |= map(fill("week"))
     | .monthly |= map(fill("month"))
+    | .backfill = { session: $x.session, hour: $x.hour }
   ' <<<"$json" 2>/dev/null || printf '%s' "$json"
+}
+
+# The session and block reports price the same models at the same $0, and
+# without these Top Sessions dropped every Opus 5.5 session off the list (a
+# $20 session ranked below a $1 one) and Current Block read $6 for a block
+# that had spent over $25. Both read the per-session and per-hour sums the
+# backfill above left in RECENT_JSON, so neither costs a second scan.
+#
+# $1 = {session:[...]} (all_sessions' shape). Same rule as the daily rows:
+# only a breakdown ccusage left at $0 is filled.
+backfill_sessions() {
+  local bf
+  bf=$(jq -c '.backfill.session // {}' <<<"$RECENT_JSON" 2>/dev/null)
+  if [ -z "$bf" ] || [ "$bf" = "{}" ]; then
+    printf '%s' "$1"
+    return
+  fi
+  jq -c --argjson x "$bf" '
+    .session |= map(
+      (.period // "") as $sid
+      | ((.modelBreakdowns // []) | map(.cost // 0) | add // 0) as $before
+      | .modelBreakdowns = [ (.modelBreakdowns // [])[]
+          | if (.cost // 0) == 0
+            then .modelName as $m | .cost = ($x[$sid][$m] // 0)
+            else . end ]
+      | .totalCost = (.totalCost // 0)
+          + (([ .modelBreakdowns[].cost ] | add // 0) - $before))
+  ' <<<"$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# $1 = block start epoch, $2 = block end epoch. Prints the backfilled cost
+# of the hours in [start, end). ccusage's block has no per-model breakdown,
+# but every model in the backfill is one it priced at $0, so this adds
+# nothing it already counted.
+backfill_block_cost() {
+  jq -r --argjson a "$1" --argjson b "$2" '
+    [ (.backfill.hour // {}) | to_entries[]
+      | select((.key | tonumber) >= $a and (.key | tonumber) < $b)
+      | .value[] ] | add // 0
+  ' <<<"$RECENT_JSON" 2>/dev/null || printf '0'
 }
 # Fetched once per slow tick by the loop and read from here, so the three
 # cache reads and the merge above happen once rather than once per caller.
@@ -1400,7 +1451,8 @@ all_sessions() {
   ccusage_cached claude session --json --offline \
     | jq -c '{session: [ (.sessions // .session // [])[]
         | .period = (.sessionId // .period)
-        | .metadata = ((.metadata // {}) + {lastActivity: (.lastActivity // .metadata.lastActivity)}) ]}' 2>/dev/null
+        | .metadata = ((.metadata // {}) + {lastActivity: (.lastActivity // .metadata.lastActivity)}) ]}' 2>/dev/null \
+    | { read -r s; backfill_sessions "$s"; }
 }
 
 # $1 = all_sessions payload, $2 = since (YYYY-MM-DD, day-inclusive),
@@ -1565,7 +1617,9 @@ try:
                 first_ts = d["timestamp"]
             if d.get("type") == "assistant":
                 m = d.get("message", {}).get("model")
-                if m:
+                # "<synthetic>" is Claude Code's own placeholder for an API
+                # error it logged as a reply, not a model that served.
+                if m and m != "<synthetic>":
                     model = m
 except OSError:
     pass
@@ -1816,6 +1870,12 @@ for line in lines:
     seen.add(mid)
 
     model = msg.get("model", "unknown")
+    # Claude Code logs an API error ("Can't reach the API server") as an
+    # assistant message from model "<synthetic>" with all-zero usage. It is
+    # not a turn, and counting it as one flagged it unpriced, which blanked
+    # Session and Burn for the rest of the session over a network blip.
+    if model == "<synthetic>":
+        continue
     turn_ts = parse_iso(d.get("timestamp"))
     in_tok = usage.get("input_tokens", 0)
     out_tok = usage.get("output_tokens", 0)
@@ -2183,6 +2243,8 @@ refresh_active_block() {
         (.models | join(", "))
       ] | @tsv
     ' <<<"$block_json")"
+    blk_cost=$(awk -v c="${blk_cost:-0}" -v x="$(backfill_block_cost "$blk_start_epoch" "$blk_end_epoch")" \
+      'BEGIN{ printf "%.6f", c + x }')
     has_block=1
   fi
 }

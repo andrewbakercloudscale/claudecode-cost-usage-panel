@@ -10,7 +10,11 @@
 #
 # Asserted: the daily, weekly and monthly rows all gain the same figure, a
 # model ccusage DID price keeps ccusage's number, and a model nobody can
-# price stays at $0 so unpriced_models still flags it.
+# price stays at $0 so unpriced_models still flags it. The session report
+# (Top Sessions, Folder) and the active block get the same backfill -- both
+# were left at ccusage's $0, which dropped every Opus 5.5 session out of Top
+# Sessions and read a $47 block as $6. Subagent transcripts, one directory
+# down, count too: ccusage counts them.
 check_AJ_unpriced_backfill() {
   sandbox_new AJ
   local tp="$HOME/.claude/projects/test-project/sess.jsonl"
@@ -23,6 +27,10 @@ check_AJ_unpriced_backfill() {
   local sonnet='{"type":"assistant","timestamp":"2026-09-22T12:00:00.000Z","requestId":"r2","message":{"id":"m2","model":"claude-sonnet-5","usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
   local nonesuch='{"type":"assistant","timestamp":"2026-09-22T12:00:00.000Z","requestId":"r3","message":{"id":"m3","model":"claude-nonesuch-9","usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
   printf '%s\n%s\n%s\n%s\n' "$opus" "$opus" "$sonnet" "$nonesuch" > "$tp"
+  # A subagent of the same session: 1M input at $4 -> 4.00, so 18.20 in all.
+  mkdir -p "$HOME/.claude/projects/test-project/sess/subagents"
+  printf '%s\n' '{"type":"assistant","sessionId":"sess","timestamp":"2026-09-22T12:30:00.000Z","requestId":"r4","message":{"id":"m4","model":"claude-opus-5-5","usage":{"input_tokens":1000000,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}' \
+    > "$HOME/.claude/projects/test-project/sess/subagents/agent-a1.jsonl"
 
   # Sonnet at a ccusage figure deliberately unlike its transcript price
   # ($2.00), so "kept ccusage's number" is distinguishable from "re-priced".
@@ -42,13 +50,26 @@ check_AJ_unpriced_backfill() {
   local k
   _aj() { printf '%.2f' "$(jq -r "$1" <<<"$r")"; }
   for k in daily weekly monthly; do
-    assert_eq "$k: Opus 5.5 priced from the transcript, deduplicated" "14.20" \
+    assert_eq "$k: Opus 5.5 priced from the transcripts, deduplicated" "18.20" \
       "$(_aj ".$k[0].modelBreakdowns[] | select(.modelName==\"claude-opus-5-5\") | .cost")"
     assert_eq "$k: a model ccusage priced keeps ccusage's figure" "5.00" \
       "$(_aj ".$k[0].modelBreakdowns[] | select(.modelName==\"claude-sonnet-5\") | .cost")"
-    assert_eq "$k: the row total includes the backfill" "19.20" \
+    assert_eq "$k: the row total includes the backfill" "23.20" \
       "$(_aj ".$k[0].totalCost")"
   done
   assert_eq "a model nobody can price is still flagged" "claude-nonesuch-9" \
     "$(unpriced_models "$r")"
+
+  # The session report: same rule, per session.
+  printf '{"sessions":[{"sessionId":"sess","totalCost":5.00,"lastActivity":"2026-09-22T12:30:00.000Z","modelBreakdowns":%s}]}\n' "$bd" \
+    > "$CCUSAGE_FIXTURE_DIR/session.json"
+  assert_eq "session: Opus 5.5 backfilled into the session's total" "23.20" \
+    "$(printf '%.2f' "$(all_sessions | jq -r '.session[0].totalCost')")"
+
+  # The active block: ccusage's $5 plus the backfilled hours inside it.
+  printf '{"blocks":[{"startTime":"2026-09-22T10:00:00.000Z","endTime":"2026-09-22T15:00:00.000Z","costUSD":5.00,"totalTokens":0,"burnRate":{},"projection":{},"models":[]}]}\n' \
+    > "$CCUSAGE_FIXTURE_DIR/blocks.json"
+  refresh_active_block
+  assert_eq "block: Opus 5.5 backfilled into the block cost" "23.20" \
+    "$(printf '%.2f' "$blk_cost")"
 }
