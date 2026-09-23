@@ -24,7 +24,7 @@ check_I_unknown_model() {
   latest="$tp"
   session_stats_refresh
   assert_eq "a known model has a window" "1000000" "$SESS_WIN"
-  assert_not_contains "and no estimate footnote" "estimated at default rates" "$SESS_TABLE"
+  assert_not_contains "and no unpriced footnote" "no known price" "$SESS_TABLE"
 
   # Claude Fable 5.1 -- present in the price table, so it must behave like
   # any other known model rather than like the unknown case below.
@@ -37,8 +37,9 @@ check_I_unknown_model() {
   printf '%s\n' '{"type":"assistant","timestamp":"2026-09-01T10:00:00.000Z","message":{"id":"m3","model":"claude-nonesuch-9","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}' > "$tp"
   session_stats_refresh
   assert_eq "an unknown model reports no window" "0" "$SESS_WIN"
-  assert_contains "and names itself as estimated" "claude-nonesuch-9" "$SESS_TABLE"
-  assert_contains "under an explicit caveat" "estimated at default rates" "$SESS_TABLE"
+  assert_contains "and names itself as unpriced" "claude-nonesuch-9" "$SESS_TABLE"
+  assert_contains "under an explicit caveat" "no known price" "$SESS_TABLE"
+  assert_eq "and no session cost is invented for it" "" "$SESS_COST"
 
   # The rendered line must say N/A, not 0%.
   #

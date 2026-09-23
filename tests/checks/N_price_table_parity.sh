@@ -23,8 +23,17 @@ check_N_price_table_parity() {
   # expensive rather than every row -- the parity assertion above covers
   # the rest.
   assert_contains "Opus 5 at 5/25"      '"claude-opus-5":(5.00,25.00),' "$a"
+  assert_contains "Opus 5.5 at 4/20"    '"claude-opus-5-5":(4.00,20.00),' "$a"
   assert_contains "Sonnet 5 at 2/10"    '"claude-sonnet-5":(2.00,10.00),' "$a"
   assert_contains "Haiku 4.5 at 1/5"    '"claude-haiku-4-5":(1.00,5.00),' "$a"
   assert_contains "Fable 5.1 at 10/50"  '"claude-fable-5-1":(10.00,50.00),' "$a"
   assert_contains "Mythos 5.1 at 10/50" '"claude-mythos-5-1":(10.00,50.00),' "$a"
+
+  # The cache-read overrides are duplicated the same way, and a missing one
+  # overstates a cache-heavy session by ~50% (Opus 5.5 reads at 0.05x).
+  local ca cb
+  ca=$(awk '/^CACHE_READ_PRICE = \{/{f++; next} f==1 && /^\}/{exit} f==1' "$PANEL_SH" | tr -d ' ' | sort)
+  cb=$(awk '/^CACHE_READ_PRICE = \{/{f++; next} f==2 && /^\}/{exit} f==2' "$PANEL_SH" | tr -d ' ' | sort)
+  assert_eq "both cache-read override tables agree" "$ca" "$cb"
+  assert_contains "Opus 5.5 cache reads at 0.20" '"claude-opus-5-5":0.20,' "$ca"
 }

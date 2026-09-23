@@ -732,6 +732,7 @@ cache_path, window_days = sys.argv[1], int(sys.argv[2])
 
 PRICES = {
     "claude-sonnet-5":   (2.00, 10.00),
+    "claude-opus-5-5":   (4.00, 20.00),
     "claude-opus-5":     (5.00, 25.00),
     "claude-haiku-4-5":  (1.00, 5.00),
     "claude-sonnet-4-6": (3.00, 15.00),
@@ -743,7 +744,13 @@ PRICES = {
     "claude-mythos-5":   (10.00, 50.00),
     "claude-mythos-5-1": (10.00, 50.00),
 }
-DEFAULT_PRICE = (3.00, 15.00)
+# Cache reads are 0.1x input on most models but not all: Opus 5.5 reads at
+# $0.20 (0.05x) and Fable 5.1 at $0.25 (0.025x). Pricing those at 0.1x
+# overstated a cache-heavy Opus 5.5 session by ~50%. $/1M, overrides only.
+CACHE_READ_PRICE = {
+    "claude-opus-5-5":   0.20,
+    "claude-fable-5-1":  0.25,
+}
 CACHE_READ_MULT, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT = 0.1, 1.25, 2.0
 
 now = time.time()
@@ -802,11 +809,17 @@ for path in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
             cw_1h = 0
             cw_5m = cc_tok
 
-        price_in, price_out = PRICES.get(model, DEFAULT_PRICE)
+        # No published rate, no figure. This used to price an unknown id at
+        # a $3/$15 stand-in, which is how a new model's spend got a
+        # confident, wrong dollar value. Left out of the projection instead.
+        if model not in PRICES:
+            continue
+        price_in, price_out = PRICES[model]
+        price_cr = CACHE_READ_PRICE.get(model, price_in * CACHE_READ_MULT)
         cost = (
             in_tok * price_in
             + out_tok * price_out
-            + cr_tok * price_in * CACHE_READ_MULT
+            + cr_tok * price_cr
             + cw_1h * price_in * CACHE_WRITE_1H_MULT
             + cw_5m * price_in * CACHE_WRITE_5M_MULT
         ) / 1_000_000
@@ -1181,6 +1194,20 @@ recent_sections_fetch() {
 RECENT_JSON=""
 recent_sections() { printf '%s' "$RECENT_JSON"; }
 
+# Models ccusage could not price, one id per line. `--offline` prices from
+# the table bundled with the installed ccusage release, and a model released
+# after it is costed at exactly $0 with its tokens still counted -- no error,
+# no warning. On 2026-09-23 that dropped ~$32 of Claude Opus 5.5 from Today
+# while Today rendered a plausible $14.62. Tokens with no cost is the
+# signature; nothing that really ran is free.
+unpriced_models() {
+  jq -r '[.daily[]?.modelBreakdowns[]?
+          | select((.cost // 0) == 0
+                   and ((.inputTokens // 0) + (.outputTokens // 0)
+                        + (.cacheCreationTokens // 0) + (.cacheReadTokens // 0)) > 0)
+          | .modelName] | unique | .[]' <<<"$1" 2>/dev/null
+}
+
 # This week's spend out of the weekly report, without knowing which day the
 # tool calls the start of a week.
 #
@@ -1462,6 +1489,7 @@ c_na = sys.argv[18]
 
 PRICES = {  # model id -> (input $/1M, output $/1M)
     "claude-sonnet-5":   (2.00, 10.00),
+    "claude-opus-5-5":   (4.00, 20.00),
     "claude-opus-5":     (5.00, 25.00),
     "claude-haiku-4-5":  (1.00, 5.00),
     "claude-sonnet-4-6": (3.00, 15.00),
@@ -1473,7 +1501,13 @@ PRICES = {  # model id -> (input $/1M, output $/1M)
     "claude-mythos-5":   (10.00, 50.00),
     "claude-mythos-5-1": (10.00, 50.00),
 }
-DEFAULT_PRICE = (3.00, 15.00)
+# Cache reads are 0.1x input on most models but not all: Opus 5.5 reads at
+# $0.20 (0.05x) and Fable 5.1 at $0.25 (0.025x). Pricing those at 0.1x
+# overstated a cache-heavy Opus 5.5 session by ~50%. $/1M, overrides only.
+CACHE_READ_PRICE = {
+    "claude-opus-5-5":   0.20,
+    "claude-fable-5-1":  0.25,
+}
 CACHE_READ_MULT, CACHE_WRITE_5M_MULT, CACHE_WRITE_1H_MULT = 0.1, 1.25, 2.0
 
 def model_label(model_id):
@@ -1661,9 +1695,8 @@ for line in lines:
     cache_pct = (cr_tok / total_ctx * 100) if total_ctx else 0.0
 
     # Substitute the model that really served before pricing, not after: a
-    # secondary model has no entry in PRICES, and falling back to
-    # DEFAULT_PRICE would just swap one invented figure for another. Cost is
-    # reported as unknown for these instead.
+    # secondary model has no entry in PRICES, and a price for it would be
+    # invented. Cost is reported as unknown for these instead.
     ev = secondary_event_for(turn_ts, out_tok)
     is_secondary = ev is not None
     if is_secondary:
@@ -1677,17 +1710,25 @@ for line in lines:
         if not total_ctx and ev_in:
             in_tok, total_ctx = ev_in, ev_in
 
-    is_estimated = model not in PRICES and not is_secondary
-    price_in, price_out = PRICES.get(model, DEFAULT_PRICE)
-    cost = (
-        in_tok * price_in
-        + out_tok * price_out
-        + cr_tok * price_in * CACHE_READ_MULT
-        + cw_1h * price_in * CACHE_WRITE_1H_MULT
-        + cw_5m * price_in * CACHE_WRITE_5M_MULT
-    ) / 1_000_000
+    # An id with no published rate gets no cost at all (None), not a guess.
+    # It used to be priced at a $3/$15 stand-in under a footnote, and a
+    # footnoted wrong number still reads as a number: Opus 5.5 ($4/$20,
+    # cache reads $0.20) sat in this table at the stand-in for its launch.
+    is_unpriced = model not in PRICES and not is_secondary
+    if model in PRICES:
+        price_in, price_out = PRICES[model]
+        price_cr = CACHE_READ_PRICE.get(model, price_in * CACHE_READ_MULT)
+        cost = (
+            in_tok * price_in
+            + out_tok * price_out
+            + cr_tok * price_cr
+            + cw_1h * price_in * CACHE_WRITE_1H_MULT
+            + cw_5m * price_in * CACHE_WRITE_5M_MULT
+        ) / 1_000_000
+    else:
+        cost = None
 
-    turns.append((model_label(model), total_ctx, cc_tok, cache_pct, cost, model, is_secondary, is_estimated))
+    turns.append((model_label(model), total_ctx, cc_tok, cache_pct, cost, model, is_secondary, is_unpriced))
 
 total_n = len(turns)
 shown = turns[-max_rows:]
@@ -1703,7 +1744,13 @@ avg_delta = (sum(t[2] for t in primary_turns) / len(primary_turns)) if primary_t
 # made, and the only one whose cache key carries a session id, so it could
 # not be shared between panels and cost that much again for every extra
 # Claude Code session running.
-print(f"#META\t{sum(t[4] for t in turns):.6f}\t{turns[-1][1] if turns else 0}"
+# The session total is left EMPTY when any primary turn is unpriced: a sum
+# that silently drops those turns is a wrong number, and the panel renders
+# an empty figure as "--". Secondary turns were never Anthropic spend, so
+# they do not blank it.
+sess_total = ("" if any(t[7] for t in turns)
+              else f"{sum(t[4] for t in turns if t[4] is not None):.6f}")
+print(f"#META\t{sess_total}\t{turns[-1][1] if turns else 0}"
       f"\t{context_window_size(turns[-1][5]) if turns else 0}")
 turn_h = f"{col_turn}{'Turn':<5}{c_reset}"
 model_h = f"{col_model}{'Model':<10}{c_reset}"
@@ -1718,7 +1765,7 @@ if shown:
     # one row that scrolls out of view first as the session grows.
     saw_secondary = False
     for i in reversed(range(len(shown))):
-        label, total_ctx, delta, cache_pct, cost, model, is_secondary, is_estimated = shown[i]
+        label, total_ctx, delta, cache_pct, cost, model, is_secondary, is_unpriced = shown[i]
         turn_no = start_idx + i
         total_str, delta_str = fmt_k(total_ctx), fmt_k(delta)
         plain_cell = f"{total_str} (+{delta_str})"
@@ -1773,7 +1820,7 @@ if shown:
         # the noise case the old comment was actually describing.
         ctx_rank = severity_rank(ctx_c)
         rank = max(severity_rank(delta_c), ctx_rank if ctx_rank >= 2 else 0)
-        cost_cell = "$" + format(cost, ".2f")
+        cost_cell = "?" if cost is None else "$" + format(cost, ".2f")
         if rank > 0:
             row_c = (col_input, col_mid_tier, col_cost, col_purple)[rank]
             print(f"  {row_c}{turn_no:<5}{label:<10}{pad}{total_str} (+{delta_str}){cache_pct:>5.0f}%{cost_cell:>8}{c_reset}")
@@ -1784,12 +1831,11 @@ if shown:
             cache_cell = f"{cache_c}{cache_pct:>5.0f}%{c_reset}"
             print(f"  {turn_no:<5}{label:<10}{input_cell}{cache_cell}{cost_cell:>8}")
     if any(t[7] for t in turns):
-        # Named, not hidden: a model absent from PRICES is priced at
-        # DEFAULT_PRICE, and that figure is a stand-in rather than a rate.
-        # Add the id above and this line goes away.
+        # Named, not hidden: a model absent from PRICES shows "?" and the
+        # session total is withheld. Add the id above and this line goes away.
         unpriced = sorted({t[5] for t in turns if t[7]})
-        print(f"  {c_na}* estimated at default rates, model not in price "
-              f"table: {', '.join(unpriced)}{c_reset}")
+        print(f"  {c_na}? no known price for {', '.join(unpriced)}; "
+              f"cost not shown{c_reset}")
     if saw_secondary:
         print(f"  {c_na}* served by claude-burst secondary; not Anthropic spend{c_reset}")
 PYEOF
@@ -2841,10 +2887,24 @@ build_summary() {
     printf '  💰 Session: --, Burn --\n'
   fi
 
-  tc=$(tier_color "$today_amt" "$avg_daily_30" "$TIER_YELLOW_MULT" "$TIER_RED_MULT" "$MIN_DAILY_ALERT")
-  pc=$(tier_color "$today_pred" "$avg_daily_30" "$TIER_YELLOW_MULT" "$TIER_RED_MULT" "$MIN_DAILY_ALERT")
-  printf '  📅 Today: %s$%s%s (by EOD: %s$%s%s)\n' \
-    "$tc" "$today_amt" "$C_RESET" "$pc" "$today_pred" "$C_RESET"
+  # A model ccusage cannot price is in its totals at $0 (see unpriced_models).
+  # Today is withheld outright when one ran today -- the missing part can be
+  # most of the day -- and every other ccusage figure is flagged, since each
+  # of them undercounts by an amount the panel has no way to know.
+  today_unpriced=$(unpriced_models "$today_daily_json" | tr '\n' ' ')
+  recent_unpriced=$(unpriced_models "$recent_json" | tr '\n' ' ')
+  if [ -n "$recent_unpriced" ]; then
+    printf '  %s⚠ no price for %s— totals below exclude it%s\n' \
+      "$C_YELLOW" "$recent_unpriced" "$C_RESET"
+  fi
+  if [ -n "$today_unpriced" ]; then
+    printf '  📅 Today: %s? (unpriced model)%s\n' "$C_YELLOW" "$C_RESET"
+  else
+    tc=$(tier_color "$today_amt" "$avg_daily_30" "$TIER_YELLOW_MULT" "$TIER_RED_MULT" "$MIN_DAILY_ALERT")
+    pc=$(tier_color "$today_pred" "$avg_daily_30" "$TIER_YELLOW_MULT" "$TIER_RED_MULT" "$MIN_DAILY_ALERT")
+    printf '  📅 Today: %s$%s%s (by EOD: %s$%s%s)\n' \
+      "$tc" "$today_amt" "$C_RESET" "$pc" "$today_pred" "$C_RESET"
+  fi
 
   if [ "${has_block:-0}" = "1" ]; then
     printf '  ⏳ Current Block: %s%s%s (%s left)\n' "$burn_color" "$(fmt_money "$blk_cost")" "$C_RESET" "$(fmt_hm "$blk_rem")"
@@ -3032,11 +3092,21 @@ build_trailing() {
     IFS=$'\t' read -r tCost tTok tIn tOut tCacheC tCacheR <<<"$(jq -r '
       .totals | [.totalCost, .totalTokens, .inputTokens, .outputTokens, .cacheCreationTokens, .cacheReadTokens] | @tsv
     ' <<<"$daily_json")"
-    printf '  %stoday:%s %s | %s tokens\n' "$C_CYAN" "$C_RESET" "$(fmt_money "$tCost")" "$(fmt_mt "$tTok")"
+    unpriced_today=$(unpriced_models "$daily_json")
+    if [ -n "$unpriced_today" ]; then
+      printf '  %stoday:%s ? | %s tokens\n' "$C_CYAN" "$C_RESET" "$(fmt_mt "$tTok")"
+    else
+      printf '  %stoday:%s %s | %s tokens\n' "$C_CYAN" "$C_RESET" "$(fmt_money "$tCost")" "$(fmt_mt "$tTok")"
+    fi
     models_line=""
     while IFS=$'\t' read -r mname mcost; do
       [ -z "$mname" ] && continue
-      seg="${C_CYAN}${mname#claude-}:${C_RESET} $(fmt_money "$mcost")"
+      # ccusage's $0 for a model it cannot price is not a cost; show "?".
+      if grep -qxF "$mname" <<<"$unpriced_today"; then
+        seg="${C_CYAN}${mname#claude-}:${C_RESET} ${C_YELLOW}?${C_RESET}"
+      else
+        seg="${C_CYAN}${mname#claude-}:${C_RESET} $(fmt_money "$mcost")"
+      fi
       models_line="${models_line:+$models_line | }$seg"
     done < <(jq -r '.daily[0].modelBreakdowns[]? | [.modelName, .cost] | @tsv' <<<"$daily_json")
     printf '  %s\n' "$models_line"
